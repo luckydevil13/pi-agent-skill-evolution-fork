@@ -22,6 +22,13 @@ import {
 } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import {
+	buildSkillMd,
+	editSkillMd,
+	parseFrontmatter,
+	patchSkillMd,
+	splitSkillMd,
+} from "./skill-md-codec.ts";
 
 const REVIEW_GUARDRAIL =
 	"\n\n## Skill Evolution\nDo not create or fully rewrite skills directly. Skill creation, frontmatter changes, package-file changes, and disabling require a skill-evolution proposal.\n";
@@ -312,54 +319,6 @@ function requireValidName(name: string | undefined): string {
 	return name;
 }
 
-function yamlSafeScalar(value: string): string {
-	const trimmed = value.trim().replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, " ");
-	return JSON.stringify(trimmed);
-}
-
-function buildSkillMd(name: string, description: string, body: string): string {
-	return `---\nname: ${name}\ndescription: ${yamlSafeScalar(description)}\n---\n\n${body.trim()}\n`;
-}
-
-function splitSkillMd(text: string): { frontmatter: string; body: string } {
-	const match = text.match(/^(---\r?\n[\s\S]*?\r?\n---\r?\n)([\s\S]*)$/);
-	if (!match) throw new Error("SKILL.md has invalid or missing frontmatter");
-	return { frontmatter: match[1], body: match[2] };
-}
-
-function replaceDescription(frontmatter: string, description: string): string {
-	const lines = frontmatter.split(/\r?\n/);
-	const index = lines.findIndex((line) => /^description\s*:/.test(line));
-	if (index < 0) throw new Error("SKILL.md frontmatter has no description");
-	lines[index] = `description: ${yamlSafeScalar(description)}`;
-	return lines.join("\n");
-}
-
-function editSkillMd(text: string, description: string | undefined, body: string): string {
-	const split = splitSkillMd(text);
-	const frontmatter = description ? replaceDescription(split.frontmatter, description) : split.frontmatter;
-	return `${frontmatter}${body.trim()}\n`;
-}
-
-function parseFrontmatter(text: string): { name?: string; description?: string; body: string } {
-	const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/);
-	if (!match) return { body: text };
-	const values: Record<string, string> = {};
-	for (const line of match[1].split(/\r?\n/)) {
-		const colon = line.indexOf(":");
-		if (colon < 0) continue;
-		const key = line.slice(0, colon).trim().toLowerCase();
-		let value = line.slice(colon + 1).trim();
-		try {
-			if (value.startsWith('"')) value = JSON.parse(value) as string;
-		} catch {
-			// Keep the raw scalar for display.
-		}
-		values[key] = value;
-	}
-	return { name: values.name, description: values.description, body: match[2] };
-}
-
 function hashText(text: string): string {
 	return createHash("sha256").update(text).digest("hex");
 }
@@ -593,9 +552,8 @@ async function applyProposal(
 					writeTextAtomic(target, editSkillMd(current, operation.description, operation.content));
 				} else if (operation.type === "patch") {
 					const current = readFileSync(target, "utf8");
-					const count = current.split(operation.find).length - 1;
-					if (count !== 1) throw new Error(`Patch find text occurs ${count} times in ${operation.path}`);
-					writeTextAtomic(target, current.replace(operation.find, operation.replace));
+					const next = patchSkillMd(current, operation.find, operation.replace);
+					writeTextAtomic(target, next);
 				} else if (operation.type === "write") {
 					mkdirSync(dirname(target), { recursive: true });
 					writeTextAtomic(target, operation.content);
@@ -655,11 +613,7 @@ async function safeBodyPatch(
 	return withFileMutationQueue(path, async () => {
 		if (!existsSync(path)) throw new Error(`Skill "${skillName}" was not found`);
 		const current = readFileSync(path, "utf8");
-		const before = splitSkillMd(current);
-		const count = before.body.split(find).length - 1;
-		if (count !== 1) throw new Error(`Patch find text occurs ${count} times in SKILL.md body`);
-		const next = `${before.frontmatter}${before.body.replace(find, replace)}`;
-		if (splitSkillMd(next).frontmatter !== before.frontmatter) throw new Error("Automatic patch cannot change frontmatter");
+		const next = patchSkillMd(current, find, replace);
 		writeTextAtomic(path, next);
 		await appendAudit(paths, scope, {
 			action: "automatic-body-patch",

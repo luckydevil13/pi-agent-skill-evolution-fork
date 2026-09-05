@@ -1,4 +1,9 @@
 {
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "typecheck": "tsc --noEmit"
+  },
   "pi": {
     "extensions": [
       "./extensions/skill-evolution.ts"
@@ -11,5 +16,12 @@
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@types/node": "*",
+    "typebox": "*",
+    "typescript": "*"
   }
 }
