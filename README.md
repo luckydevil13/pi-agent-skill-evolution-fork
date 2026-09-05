@@ -59,6 +59,65 @@ The LLM can call `skill_manage patch` without a proposal only when all these con
 
 Create, full edit, frontmatter changes, package-file writes, and disable operations require a proposal.
 
+## Architecture
+
+The extension is a thin Pi adapter around standalone modules. The dependency direction is:
+
+```text
+extensions/skill-evolution.ts (Pi lifecycle, model registry, command/tool adapter)
+                    |
+                    v
+extensions/skill-evolution-engine.ts (session policy and command orchestration)
+       |                 |                    |
+       v                 v                    v
+activity-store      review-pipeline      skill-mutations
+       |                 |                    |
+       v                 v                    v
+   stats/audit      egress-redaction     proposal-ledger
+                                             |
+                                             v
+                                      skill-package
+                                             |
+                                             v
+                                      skill-md-codec
+```
+
+Public seams are deliberately small:
+
+- `createSkillEvolutionEngine(options)` accepts an `EngineSession` supplied by Pi (or tests), and exposes lifecycle methods plus `command()` and `executeTool()`.
+- `createReviewPipeline(options)` accepts a `ModelCall`; it owns run batching, isolated prompts, JSON protocol validation, and proposal persistence.
+- `createProposalLedger(paths)` owns proposal hashes, status transitions, duplicate detection, and transactional apply/rollback.
+- `ActivityStore` owns per-scope statistics, audit records, inactivity calculations, and serialized file updates.
+- `createSkillMutations(paths)` owns guarded package mutations and delegates package/path validation to `skill-package`.
+- `serializeRun()` and `serializeStructuredMessages()` in `egress-redaction.ts` are the only message-shape serialization boundary for reviewer prompts.
+- `skill-md-codec.ts` handles frontmatter/body parsing and body-only patch rules.
+
+The Pi adapter is responsible only for lifecycle events, model selection, notifications, confirmation dialogs, and registration of `/skill-evolution` and `skill_manage`.
+
+## Verification
+
+Install dependencies and run the same checks used by CI:
+
+```bash
+npm install
+npm test
+npm run typecheck
+```
+
+`npm test` uses Node's built-in test runner and includes module tests plus the command/extension smoke test. The smoke test exercises extension registration and the review/proposal lifecycle, including listing, showing, rejecting, applying, and package state commands.
+
+## Security contour
+
+Security-sensitive behavior is tested at the module boundary rather than only through the Pi UI:
+
+- `skill-package.test.js` covers skill-name validation, path traversal, absolute paths, symlink escapes, scope collisions, and discovery of disabled/unreadable packages.
+- `skill-md-codec.test.js` covers frontmatter preservation and the restriction that direct patches cannot alter frontmatter or descriptions.
+- `proposal-ledger.test.js` covers source-hash stale detection, duplicate drafts, and rollback after a mid-transaction failure.
+- `review-pipeline.test.js` covers the structural egress allowlist: only known message roles/content are sent, secrets/images/unknown fields are removed, output is byte-bounded, malformed reviewer JSON is retried, and aborts do not persist proposals.
+- `skill-evolution-engine.test.js` covers trusted-project boundaries, session cursor restoration, review batching, and reminder behavior.
+
+The runtime guardrail is short and always present in the system prompt. Direct mutation is limited to an explicit-scope, unique body-only `SKILL.md` patch; creation, full edits, package-file writes, frontmatter changes, disable, and purge require the proposal workflow. Project state and project-scope mutations require a trusted project, and purge requires interactive confirmation.
+
 ## Installation
 
 ### Pi package
