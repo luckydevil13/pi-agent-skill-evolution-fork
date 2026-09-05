@@ -23,7 +23,7 @@ import {
 	discoverSkills,
 	validateSkillName,
 } from "./skill-package.ts";
-import { buildSkillMd, editSkillMd, patchSkillMd } from "./skill-md-codec.ts";
+import { createSkillMutations } from "./skill-mutations.ts";
 
 export type ProposalStatus = "pending" | "applied" | "rejected" | "stale";
 export type ProposalOperation =
@@ -131,52 +131,12 @@ export class ProposalLedger {
 		if (proposal.status !== "pending") throw new Error(`Proposal is ${proposal.status}, not pending`);
 		const path = proposalPath(this.paths, proposal.scope, proposal.id);
 		this.assertFresh(proposal);
-		const snapshots = new Map<string, { exists: boolean; content?: string }>();
-		const createdDirs = new Set<string>();
-		const renames: Array<[string, string]> = [];
-		try {
-			this.validateOperations(proposal.scope, proposal.operations);
-			for (const [index, operation] of proposal.operations.entries()) {
-				await this.options.onOperation?.(operation, index);
-				const target = this.operationPath(proposal.scope, operation);
-				if (!snapshots.has(target)) snapshots.set(target, { exists: existsSync(target), content: existsSync(target) && statSync(target).isFile() ? readFileSync(target, "utf8") : undefined });
-				const root = skillDirectory(skillsDir(this.paths, proposal.scope), operation.skillName);
-				if (!existsSync(root)) createdDirs.add(root);
-				if (operation.type === "create") {
-					mkdirSync(root, { recursive: true });
-					atomicWrite(target, buildSkillMd(operation.skillName, operation.description, operation.content));
-				} else if (operation.type === "edit") {
-					atomicWrite(target, editSkillMd(readFileSync(target, "utf8"), operation.description, operation.content));
-				} else if (operation.type === "patch") {
-					atomicWrite(target, patchSkillMd(readFileSync(target, "utf8"), operation.find, operation.replace));
-				} else if (operation.type === "write") {
-					mkdirSync(dirname(target), { recursive: true });
-					atomicWrite(target, operation.content);
-				} else {
-					const disabled = join(skillsDir(this.paths, proposal.scope), `.disabled-${operation.skillName}`);
-					if (existsSync(disabled)) throw new Error(`Disabled target already exists: ${disabled}`);
-					renameSync(root, disabled);
-					renames.push([root, disabled]);
-				}
-			}
-			proposal.status = "applied";
-			proposal.updatedAt = new Date().toISOString();
-			writeProposal(path, proposal);
-		} catch (error) {
-			for (const [from, to] of renames.reverse()) {
-				if (existsSync(to) && !existsSync(from)) renameSync(to, from);
-			}
-			for (const [target, snapshot] of [...snapshots.entries()].reverse()) {
-				if (snapshot.exists && snapshot.content !== undefined) atomicWrite(target, snapshot.content);
-				else if (!snapshot.exists && existsSync(target) && statSync(target).isFile()) unlinkSync(target);
-			}
-			for (const directory of createdDirs) if (existsSync(directory)) rmSync(directory, { recursive: true, force: true });
-			throw error;
-		}
-		await this.activity.recordActivity(proposal.scope, proposal.operations.map((operation) => operation.skillName), "management", undefined, {
-			action: "apply-proposal", proposalId: proposal.id,
-			operations: proposal.operations.map((operation) => ({ type: operation.type, skillName: operation.skillName, beforeHash: operation.beforeHash ?? null, afterHash: fileHash(this.operationPath(proposal.scope, operation)) })),
-		});
+		this.validateOperations(proposal.scope, proposal.operations);
+		const mutations = createSkillMutations(this.paths, this.activity);
+		await mutations.applyProposal(proposal, (operation, index) => this.options.onOperation?.(operation, index));
+		proposal.status = "applied";
+		proposal.updatedAt = new Date().toISOString();
+		writeProposal(path, proposal);
 	}
 
 	async reject(proposalOrId: Proposal | string, scope?: Scope): Promise<Proposal> {

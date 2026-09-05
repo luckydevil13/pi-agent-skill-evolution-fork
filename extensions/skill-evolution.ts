@@ -9,18 +9,14 @@ import { Type } from "typebox";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
-import {
-	buildSkillMd,
-	editSkillMd,
-	patchSkillMd,
-	splitSkillMd,
-} from "./skill-md-codec.ts";
+import { splitSkillMd } from "./skill-md-codec.ts";
 import { ActivityStore, type ActivityPaths } from "./activity-store.ts";
+import { createSkillMutations, type SkillMutations } from "./skill-mutations.ts";
 import { createReviewPipeline, serializeRun as serializePipelineRun } from "./review-pipeline.ts";
+import { createProposalLedger } from "./proposal-ledger.ts";
 import {
 	discoverSkills,
 	fileHash,
-	hashText,
 	requireSkillName,
 	resolveSkill,
 	safePackagePath,
@@ -324,131 +320,22 @@ function validateOperationMinimal(
 }
 
 async function applyProposal(
-	activity: ActivityStore,
-	paths: Paths,
-	proposalPath: string,
+	_paths: Paths,
 	proposal: Proposal,
-	includeProject: boolean,
+	_onOperation?: (operation: ProposalOperation, index: number) => void | Promise<void>,
 ): Promise<void> {
-	if (proposal.status !== "pending") throw new Error(`Proposal is ${proposal.status}, not pending`);
-	const targets = proposal.operations.map((operation) => operationPath(paths, proposal.scope, operation));
-	await withQueues([...targets, proposalPath], async () => {
-		try {
-			assertProposalFresh(paths, proposal);
-		} catch (error) {
-			proposal.status = "stale";
-			proposal.updatedAt = new Date().toISOString();
-			writeJsonAtomic(proposalPath, proposal);
-			throw error;
-		}
-		const createdSkills = new Set(
-			proposal.operations.filter((operation) => operation.type === "create").map((operation) => operation.skillName),
-		);
-		for (const operation of proposal.operations) {
-			validateOperationMinimal(paths, proposal.scope, operation, createdSkills, includeProject);
-		}
-
-		const snapshots = new Map<string, { existed: boolean; content?: string }>();
-		const createdSkillDirs = new Set<string>();
-		const disabledRenames: Array<{ from: string; to: string }> = [];
-		try {
-			for (const operation of proposal.operations) {
-				const root = skillDirectory(skillsDir(paths, proposal.scope), operation.skillName);
-				const rootExisted = existsSync(root);
-				if (!rootExisted) createdSkillDirs.add(root);
-				const target = operationPath(paths, proposal.scope, operation);
-				if (!snapshots.has(target)) {
-					snapshots.set(target, {
-						existed: existsSync(target),
-						content: existsSync(target) && statSync(target).isFile() ? readFileSync(target, "utf8") : undefined,
-					});
-				}
-
-				if (operation.type === "create") {
-					if (existsSync(target)) throw new Error(`Skill "${operation.skillName}" already exists`);
-					mkdirSync(root, { recursive: true });
-					writeTextAtomic(target, buildSkillMd(operation.skillName, operation.description, operation.content));
-				} else if (operation.type === "edit") {
-					const current = readFileSync(target, "utf8");
-					writeTextAtomic(target, editSkillMd(current, operation.description, operation.content));
-				} else if (operation.type === "patch") {
-					const current = readFileSync(target, "utf8");
-					const next = patchSkillMd(current, operation.find, operation.replace);
-					writeTextAtomic(target, next);
-				} else if (operation.type === "write") {
-					mkdirSync(dirname(target), { recursive: true });
-					writeTextAtomic(target, operation.content);
-				} else {
-					const disabled = join(skillsDir(paths, proposal.scope), `.disabled-${operation.skillName}`);
-					if (existsSync(disabled)) throw new Error(`Disabled target already exists: ${disabled}`);
-					renameSync(root, disabled);
-					disabledRenames.push({ from: root, to: disabled });
-				}
-			}
-
-			proposal.status = "applied";
-			proposal.updatedAt = new Date().toISOString();
-			writeJsonAtomic(proposalPath, proposal);
-		} catch (error) {
-			for (const rename of disabledRenames.reverse()) {
-				if (existsSync(rename.to) && !existsSync(rename.from)) renameSync(rename.to, rename.from);
-			}
-			for (const [path, snapshot] of [...snapshots.entries()].reverse()) {
-				if (snapshot.existed && snapshot.content !== undefined) {
-					mkdirSync(dirname(path), { recursive: true });
-					writeTextAtomic(path, snapshot.content);
-				} else if (!snapshot.existed && existsSync(path) && statSync(path).isFile()) {
-					unlinkSync(path);
-				}
-			}
-			for (const dir of createdSkillDirs) {
-				if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
-			}
-			throw error;
-		}
-	});
-
-	await activity.recordActivity(
-		proposal.scope,
-		proposal.operations.map((operation) => operation.skillName),
-		"management",
-		undefined,
-		{
-			action: "apply-proposal",
-			proposalId: proposal.id,
-			operations: proposal.operations.map((operation) => ({
-				type: operation.type,
-				skillName: operation.skillName,
-				beforeHash: operation.beforeHash ?? null,
-				afterHash: fileHash(operationPath(paths, proposal.scope, operation)),
-			})),
-		},
-	);
+	const ledger = createProposalLedger(_paths, { onOperation: _onOperation });
+	await ledger.apply(proposal);
 }
 
 async function safeBodyPatch(
-	activity: ActivityStore,
-	paths: Paths,
+	mutations: SkillMutations,
 	scope: Scope,
 	skillName: string,
 	find: string,
 	replace: string,
 ): Promise<string> {
-	const path = join(skillDirectory(skillsDir(paths, scope), skillName), "SKILL.md");
-	return withFileMutationQueue(path, async () => {
-		if (!existsSync(path)) throw new Error(`Skill "${skillName}" was not found`);
-		const current = readFileSync(path, "utf8");
-		const next = patchSkillMd(current, find, replace);
-		writeTextAtomic(path, next);
-		await activity.recordActivity(scope, skillName, "management", undefined, {
-			action: "automatic-body-patch",
-			skillName,
-			beforeHash: hashText(current),
-			afterHash: hashText(next),
-			diff: { find, replace },
-		});
-		return path;
-	});
+	return mutations.bodyPatch(scope, skillName, find, replace);
 }
 
 function loadAuthoringReference(paths: Paths): string {
@@ -568,6 +455,7 @@ const SkillManageParameters = Type.Object({
 export default function skillEvolution(pi: ExtensionAPI) {
 	let paths = getPaths(process.cwd());
 	let activity = new ActivityStore(paths);
+	let mutations: SkillMutations = createSkillMutations(paths, activity);
 	let config = readConfig(paths, false);
 	let pendingAgentMessages: unknown[] = [];
 	let pendingRuns: RunRecord[] = [];
@@ -666,13 +554,14 @@ export default function skillEvolution(pi: ExtensionAPI) {
 		config = readConfig(paths, projectTrusted);
 		sessionAbort = new AbortController();
 		activity = new ActivityStore(paths);
+		mutations = createSkillMutations(paths, activity);
 		pendingAgentMessages = [];
 		reviewQueue.length = 0;
 		reviewRunning = false;
 		restoreReviewState(ctx);
 		cleanOldProposals(paths, projectTrusted);
 
-		activity.removeLegacyStats();
+		mutations.removeLegacyStats();
 
 		const enabledScopes: Scope[] = projectTrusted ? ["global", "project"] : ["global"];
 		const initialReminderChoice = enabledScopes.some(
@@ -793,7 +682,7 @@ export default function skillEvolution(pi: ExtensionAPI) {
 			if (operation === "patch" && !params.proposalId) {
 				if (!requestedScope) throw new Error('Body-only patch requires explicit "scope"');
 				if (!params.find) throw new Error('Missing "find" for patch');
-				const path = await safeBodyPatch(activity, paths, requestedScope, skillName, params.find, params.replace ?? "");
+				const path = await safeBodyPatch(mutations, requestedScope, skillName, params.find, params.replace ?? "");
 				return { content: [{ type: "text" as const, text: `Patched ${path}` }], details: { path } };
 			}
 
@@ -809,7 +698,7 @@ export default function skillEvolution(pi: ExtensionAPI) {
 			if (found.proposal.scope === "project" && !ctx.isProjectTrusted()) {
 				throw new Error("Applying a project proposal requires a trusted project");
 			}
-			await applyProposal(activity, paths, found.path, found.proposal, ctx.isProjectTrusted());
+			await applyProposal(paths, found.proposal);
 			return {
 				content: [{ type: "text" as const, text: `Applied proposal ${found.proposal.id}. Run /reload if discovery data changed.` }],
 				details: { proposalId: found.proposal.id },
@@ -879,7 +768,7 @@ export default function skillEvolution(pi: ExtensionAPI) {
 						ctx.ui.notify(`Rejected proposal ${found.proposal.id}`, "info");
 						return;
 					}
-					await applyProposal(activity, paths, found.path, found.proposal, ctx.isProjectTrusted());
+					await applyProposal(paths, found.proposal);
 					ctx.ui.notify(`Applied proposal ${found.proposal.id}. Run /reload if discovery data changed.`, "info");
 					return;
 				}
@@ -933,29 +822,13 @@ export default function skillEvolution(pi: ExtensionAPI) {
 					throw new Error("Project-scope commands require a trusted project");
 				}
 				const name = requireSkillName(tokens[2]);
-				const active = skillDirectory(skillsDir(paths, scope), name);
-				const disabled = join(skillsDir(paths, scope), `.disabled-${name}`);
-				if (action === "disable") {
-					if (!existsSync(join(active, "SKILL.md"))) throw new Error(`Active skill "${name}" was not found`);
-					if (existsSync(disabled)) throw new Error(`Disabled skill "${name}" already exists`);
-					renameSync(active, disabled);
-					await activity.recordActivity(scope, name, "management", undefined, { action, skillName: name });
-					ctx.ui.notify(`Disabled ${scope} skill "${name}". Run /reload.`, "info");
+				if (action === "disable" || action === "enable") {
+					await mutations.setEnabled(scope, name, action === "enable");
+					ctx.ui.notify(`${action === "enable" ? "Enabled" : "Disabled"} ${scope} skill "${name}". Run /reload.`, "info");
 					return;
 				}
-				if (action === "enable") {
-					if (!existsSync(disabled)) throw new Error(`Disabled skill "${name}" was not found`);
-					if (existsSync(active)) throw new Error(`Active target "${name}" already exists`);
-					renameSync(disabled, active);
-					await activity.recordActivity(scope, name, "management", undefined, { action, skillName: name });
-					ctx.ui.notify(`Enabled ${scope} skill "${name}". Run /reload.`, "info");
-					return;
-				}
-				const target = existsSync(disabled) ? disabled : active;
-				if (!existsSync(target)) throw new Error(`Skill "${name}" was not found`);
-				if (!ctx.hasUI || !(await ctx.ui.confirm("Purge skill package?", `Delete ${target} permanently?`))) return;
-				rmSync(target, { recursive: true, force: true });
-				await activity.recordActivity(scope, name, "management", undefined, { action, skillName: name });
+				const confirmed = ctx.hasUI && await ctx.ui.confirm("Purge skill package?", `Delete package "${name}" permanently?`);
+				if (!await mutations.purge(scope, name, confirmed)) return;
 				ctx.ui.notify(`Purged ${scope} skill "${name}". Run /reload.`, "info");
 				return;
 			}
