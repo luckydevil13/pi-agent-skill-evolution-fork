@@ -4,6 +4,9 @@
 import { readFileSync } from "node:fs";
 import { discoverSkills, type SkillRoots, type Scope } from "./skill-package.ts";
 import { createProposalLedger, type Proposal, type ProposalDraft, type ProposalOperation } from "./proposal-ledger.ts";
+import { EGRESS_BUDGETS, serializeRun, truncateUtf8 } from "./egress-redaction.ts";
+
+export { serializeRun };
 
 export interface ReviewRun {
 	index: number;
@@ -59,32 +62,7 @@ Allowed operations:
 - {"type":"write","skillName":"...","path":"relative text path","content":"..."}
 - {"type":"disable","skillName":"..."}`;
 
-const DEFAULT_MAX_RUN_BYTES = 20 * 1024;
-const DEFAULT_MAX_REVIEW_BYTES = 120 * 1024;
 const DEFAULT_TIMEOUT_MS = 120_000;
-
-function truncate(text: string, maxBytes: number): string {
-	if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
-	let result = text.slice(0, maxBytes);
-	while (Buffer.byteLength(result, "utf8") > maxBytes) result = result.slice(0, -1);
-	return `${result}\n\n[Output truncated at ${maxBytes} bytes.]`;
-}
-
-export function redactRun(text: string): string {
-	return text
-		.replace(/data:[^;\s]+;base64,[A-Za-z0-9+/=]+/g, "[image removed]")
-		.replace(/\b(?:sk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{16,}\b/g, "[secret removed]")
-		.replace(/(api[_-]?key|token|password|secret)\s*[:=]\s*[^\s,;]+/gi, "$1=[secret removed]");
-}
-
-/** Stable, bounded representation of model messages. */
-export function serializeRun(messages: unknown[], maxBytes = DEFAULT_MAX_RUN_BYTES): string {
-	return truncate(redactRun(JSON.stringify(messages, (_key, value) => {
-		if (value && typeof value === "object" && (value as { type?: string }).type === "image") return "[image removed]";
-		if (typeof value === "string" && value.length > 4000) return `${value.slice(0, 4000)}…[truncated]`;
-		return value;
-	})), maxBytes);
-}
 
 /** Parses fenced and unfenced JSON, but never accepts a non-object response. */
 export function parseJsonObject<T>(text: string): T {
@@ -152,15 +130,15 @@ export class ReviewPipeline {
 
 	private async runAttempt(runs: ReviewRun[], config: ReviewConfig, signal: AbortSignal): Promise<Proposal[]> {
 		if (signal.aborted) throw new Error("Review aborted");
-		const maxRunBytes = this.options.maxRunBytes ?? DEFAULT_MAX_RUN_BYTES;
-		const reviewText = truncate(runs.map((run) => `## Run ${run.index} (${run.timestamp})\n${truncate(run.text, maxRunBytes)}`).join("\n\n"), this.options.maxReviewBytes ?? DEFAULT_MAX_REVIEW_BYTES);
+		const maxRunBytes = this.options.maxRunBytes ?? EGRESS_BUDGETS.runBytes;
+		const reviewText = truncateUtf8(runs.map((run) => `## Run ${run.index} (${run.timestamp})\n${truncateUtf8(run.text, maxRunBytes)}`).join("\n\n"), this.options.maxReviewBytes ?? EGRESS_BUDGETS.reviewBytes);
 		const catalog = discoverSkills(this.options.paths).filter((skill) => skill.scope === "global" || this.options.trustedProject);
 		const catalogText = catalog.map((skill) => `- ${skill.scope}:${skill.name} — ${skill.description}`).join("\n");
 		const call = (systemPrompt: string, prompt: string) => this.options.model({ model: config.reviewModel, systemPrompt, prompt, signal });
 
 		const selection = parseJsonObject<{ relevantSkills?: unknown }>(await call(SELECTOR_SYSTEM_PROMPT, `Existing skills:\n${catalogText || "(none)"}\n\nAgent runs:\n${reviewText}`));
 		const relevant = new Set(Array.isArray(selection.relevantSkills) ? selection.relevantSkills.filter((item): item is string => typeof item === "string").slice(0, 5) : []);
-		const bodies = catalog.filter((skill) => relevant.has(`${skill.scope}:${skill.name}`)).map((skill) => `## ${skill.scope}:${skill.name}\n${truncate(readFileSync(skill.path, "utf8"), 20 * 1024)}`).join("\n\n");
+		const bodies = catalog.filter((skill) => relevant.has(`${skill.scope}:${skill.name}`)).map((skill) => `## ${skill.scope}:${skill.name}\n${truncateUtf8(readFileSync(skill.path, "utf8"), EGRESS_BUDGETS.skillBodyBytes)}`).join("\n\n");
 		const result = parseJsonObject<{ status?: string; proposals?: unknown }>(await call(REVIEW_SYSTEM_PROMPT, `Maximum proposals: ${config.maxProposals}\n\nAuthoring reference:\n${this.options.authoringReference}\n\nExisting skill catalog:\n${catalogText || "(none)"}\n\nRelevant skill bodies:\n${bodies || "(none selected)"}\n\nAgent runs:\n${reviewText}`));
 		if (result.status === "no_change" || !Array.isArray(result.proposals) || result.proposals.length === 0) return [];
 		const proposals: Proposal[] = [];

@@ -6,6 +6,7 @@ import { createSkillMutations, type SkillMutations } from "./skill-mutations.ts"
 import { createReviewPipeline, serializeRun, type ReviewRun, type ReviewConfig as PipelineConfig } from "./review-pipeline.ts";
 import { createProposalLedger, type Proposal, type ProposalOperation } from "./proposal-ledger.ts";
 import { discoverSkills, requireSkillName, resolveSkill, safePackagePath, skillDirectory, type Scope } from "./skill-package.ts";
+import { EGRESS_BUDGETS } from "./egress-redaction.ts";
 
 export interface EnginePaths extends ActivityPaths {}
 export interface EngineConfig extends PipelineConfig { inactiveDays: number }
@@ -40,7 +41,7 @@ function configOf(config: EngineConfig): EngineConfig {
 }
 function scopes(trusted: boolean): Scope[] { return trusted ? ["global", "project"] : ["global"]; }
 function proposalSummary(p: Proposal): string { return `# ${p.title}\n\nID: ${p.id}\nStatus: ${p.status}\nScope: ${p.scope}\nCreated: ${p.createdAt}\n\n${p.rationale}\n\nOperations:\n${p.operations.map((o) => `  - ${o.type} ${o.skillName}${o.type === "patch" || o.type === "write" ? `/${o.path}` : ""}`).join("\n")}`; }
-function truncate(value: string, bytes = 50 * 1024): string { if (Buffer.byteLength(value) <= bytes) return value; let result = value.slice(0, bytes); while (Buffer.byteLength(result) > bytes) result = result.slice(0, -1); return `${result}\n\n[Output truncated at ${bytes} bytes.]`; }
+function truncate(value: string, bytes = EGRESS_BUDGETS.toolOutputBytes): string { if (Buffer.byteLength(value) <= bytes) return value; let result = value.slice(0, bytes); while (Buffer.byteLength(result) > bytes) result = result.slice(0, -1); return `${result}\n\n[Output truncated at ${bytes} bytes.]`; }
 function section(value: string, query?: string): string { if (!query) return truncate(value); const start = value.indexOf(query); if (start < 0) return truncate(value.slice(0, 2000)); const end = value.indexOf("\n#", start + query.length); return truncate(value.slice(start, end < 0 ? undefined : end)); }
 
 /** Pure session policy. Pi, tests, or another host provide only EngineSession. */

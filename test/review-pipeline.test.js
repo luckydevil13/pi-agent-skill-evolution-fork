@@ -3,7 +3,7 @@ import test from "node:test";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createReviewPipeline, parseJsonObject } from "../extensions/review-pipeline.ts";
+import { createReviewPipeline, parseJsonObject, serializeRun } from "../extensions/review-pipeline.ts";
 
 function paths(root) {
 	return { globalSkills: join(root, "global-skills"), projectSkills: join(root, "project-skills"), globalState: join(root, "global-state"), projectState: join(root, "project-state") };
@@ -60,6 +60,40 @@ test("limits proposals and drops project proposals in an untrusted project", asy
 	const result = await createReviewPipeline({ paths: paths(root), config: config(2), trustedProject: false, authoringReference: "", model: fake.model }).review(run());
 	assert.equal(result.length, 2);
 	assert.ok(result.every((item) => item.scope === "global"));
+});
+
+test("structural egress allowlist keeps secrets, images, and unknown fields out of prompts", async (t) => {
+	const root = temp(t);
+	const messages = [
+		{ role: "user", content: [{ type: "text", text: "token: sk-test_1234567890123456 apiKey=do-not-send" }, { type: "image", data: "data:image/png;base64," + "A".repeat(1000) }], metadata: "ghp_1234567890123456" },
+		{ role: "assistant", content: [{ type: "unknown", payload: "xoxb-1234567890123456" }] },
+		{ role: "user", content: "safe text" , hidden: { password: "secret-value" } },
+		{ arbitrary: "xoxb-1234567890123456" },
+	];
+	const serialized = serializeRun(messages);
+	assert.match(serialized, /image removed/);
+	assert.match(serialized, /unsupported/);
+	assert.doesNotMatch(serialized, /sk-test|ghp_|xoxb-|do-not-send|secret-value|data:image/);
+	assert.deepEqual(JSON.parse(serialized), [
+		{ role: "user", content: [{ type: "text", text: "[secret removed] [secret removed]" }, "[image removed]"] },
+		{ role: "assistant", content: ["[unsupported content removed]"] },
+		{ role: "user", content: "safe text" },
+		"[unsupported message removed]",
+	]);
+
+	const prompts = [];
+	const model = async ({ systemPrompt, prompt }) => {
+		prompts.push(prompt);
+		return systemPrompt.includes("Select existing") ? '{"relevantSkills":[]}' : '{"status":"no_change","proposals":[]}';
+	};
+	await createReviewPipeline({ paths: paths(root), config: config(), trustedProject: true, authoringReference: "", model }).review([{ index: 1, timestamp: new Date().toISOString(), text: serialized }]);
+	assert.ok(prompts.every((prompt) => !/sk-test|ghp_|xoxb-|do-not-send|secret-value|data:image/.test(prompt)));
+});
+
+test("structural serialization tolerates unexpected and cyclic message values", () => {
+	const cyclic = { role: "user", content: "ok" };
+	cyclic.self = cyclic;
+	assert.doesNotThrow(() => serializeRun([cyclic, null, 42, { role: "user" }]));
 });
 
 test("abort interrupts model wait and leaves no proposal files", async (t) => {
