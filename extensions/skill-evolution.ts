@@ -16,6 +16,7 @@ import {
 	splitSkillMd,
 } from "./skill-md-codec.ts";
 import { ActivityStore, type ActivityPaths } from "./activity-store.ts";
+import { createReviewPipeline, serializeRun as serializePipelineRun } from "./review-pipeline.ts";
 import {
 	discoverSkills,
 	fileHash,
@@ -35,29 +36,9 @@ const DEFAULT_MAX_PROPOSALS = 3;
 const DEFAULT_INACTIVE_DAYS = 30;
 const REMINDER_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_TOOL_OUTPUT_BYTES = 50 * 1024;
-const MAX_RUN_BYTES = 20 * 1024;
-const MAX_REVIEW_BYTES = 120 * 1024;
 const PROPOSAL_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const RUN_ENTRY_TYPE = "skill-evolution-run-v2";
 const REVIEW_STATE_ENTRY_TYPE = "skill-evolution-review-state-v2";
-
-const REVIEW_SYSTEM_PROMPT = `You are the isolated reviewer for skill evolution.
-Find reusable workflows in the supplied agent runs. Prefer updating an existing skill over creating a duplicate.
-A proposal is justified only when a workflow repeated, or when it captured a difficult error, recovery, or non-obvious sequence.
-Return JSON only. Do not use Markdown fences. Never include secrets.
-The final JSON is either {"status":"no_change","proposals":[]} or:
-{"status":"proposals","proposals":[{"title":"...","rationale":"...","scope":"global|project","operations":[...]}]}.
-Allowed operations:
-- {"type":"create","skillName":"...","description":"...","content":"SKILL.md body without frontmatter"}
-- {"type":"edit","skillName":"...","description":"optional replacement","content":"replacement SKILL.md body"}
-- {"type":"patch","skillName":"...","path":"SKILL.md or relative text path","find":"unique exact text","replace":"..."}
-- {"type":"write","skillName":"...","path":"relative text path","content":"..."}
-- {"type":"disable","skillName":"..."}
-Create at most the requested number of proposals. Use project scope for repository-specific rules and global scope for reusable workflows.`;
-
-const SELECTOR_SYSTEM_PROMPT = `Select existing skills that may cover the supplied workflows.
-Return JSON only as {"relevantSkills":["scope:name", ...]}.
-Select at most five. Return an empty array if no existing skill is relevant.`;
 
 interface ReviewConfig {
 	reviewModel?: string;
@@ -487,38 +468,12 @@ function loadAuthoringReference(paths: Paths): string {
 	].join("\\n");
 }
 
-function redactText(text: string): string {
-	return text
-		.replace(/data:[^;\s]+;base64,[A-Za-z0-9+/=]+/g, "[image removed]")
-		.replace(/\b(?:sk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{16,}\b/g, "[secret removed]")
-		.replace(/(api[_-]?key|token|password|secret)\s*[:=]\s*[^\s,;]+/gi, "$1=[secret removed]");
-}
-
-function serializeRun(messages: unknown[]): string {
-	const text = redactText(
-		JSON.stringify(messages, (_key, value) => {
-			if (value && typeof value === "object" && (value as { type?: string }).type === "image") return "[image removed]";
-			if (typeof value === "string" && value.length > 4000) return `${value.slice(0, 4000)}…[truncated]`;
-			return value;
-		}),
-	);
-	return truncateText(text, MAX_RUN_BYTES);
-}
-
 function extractTextResponse(response: { content: Array<{ type: string; text?: string }> }): string {
 	return response.content
 		.filter((part) => part.type === "text")
 		.map((part) => part.text ?? "")
 		.join("\n")
 		.trim();
-}
-
-function parseJsonResponse<T>(text: string): T {
-	const unfenced = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
-	const start = unfenced.indexOf("{");
-	const end = unfenced.lastIndexOf("}");
-	if (start < 0 || end < start) throw new Error("Reviewer returned no JSON object");
-	return JSON.parse(unfenced.slice(start, end + 1)) as T;
 }
 
 function selectReviewModel(ctx: ExtensionContext, config: ReviewConfig) {
@@ -575,67 +530,6 @@ async function completeJson(
 		},
 	);
 	return extractTextResponse(response);
-}
-
-async function runReviewer(
-	ctx: ExtensionContext,
-	paths: Paths,
-	config: ReviewConfig,
-	runs: RunRecord[],
-	sessionSignal: AbortSignal,
-): Promise<Proposal[]> {
-	const reviewText = truncateText(
-		runs.map((run) => `## Run ${run.index} (${run.timestamp})\n${run.text}`).join("\n\n"),
-		MAX_REVIEW_BYTES,
-	);
-	const catalog = discoverSkills(paths).filter((skill) => skill.scope === "global" || ctx.isProjectTrusted());
-	const catalogText = catalog
-		.map((skill) => `- ${skill.scope}:${skill.name} — ${skill.description}`)
-		.join("\n");
-
-	const attempt = async (): Promise<Proposal[]> => {
-		const selectionText = await completeJson(
-			ctx,
-			config,
-			SELECTOR_SYSTEM_PROMPT,
-			`Existing skills:\n${catalogText || "(none)"}\n\nAgent runs:\n${reviewText}`,
-			sessionSignal,
-		);
-		const selection = parseJsonResponse<{ relevantSkills?: string[] }>(selectionText);
-		const relevant = new Set((selection.relevantSkills ?? []).slice(0, 5));
-		const bodies = catalog
-			.filter((skill) => relevant.has(`${skill.scope}:${skill.name}`))
-			.map((skill) => `## ${skill.scope}:${skill.name}\n${truncateText(readFileSync(skill.path, "utf8"), 20 * 1024)}`)
-			.join("\n\n");
-
-		const finalText = await completeJson(
-			ctx,
-			config,
-			REVIEW_SYSTEM_PROMPT,
-			`Maximum proposals: ${config.maxProposals}\n\nAuthoring reference:\n${loadAuthoringReference(paths)}\n\nExisting skill catalog:\n${catalogText || "(none)"}\n\nRelevant skill bodies:\n${bodies || "(none selected)"}\n\nAgent runs:\n${reviewText}`,
-			sessionSignal,
-		);
-		const result = parseJsonResponse<{ status?: string; proposals?: ReviewerDraft[] }>(finalText);
-		if (result.status === "no_change" || !result.proposals?.length) return [];
-		const drafts = result.proposals.slice(0, config.maxProposals);
-		const proposals: Proposal[] = [];
-		for (const draft of drafts) {
-			if (draft.scope === "project" && !ctx.isProjectTrusted()) continue;
-			proposals.push(await saveProposal(paths, draft, ctx.isProjectTrusted()));
-		}
-		return proposals;
-	};
-
-	let lastError: unknown;
-	for (let attemptIndex = 0; attemptIndex < 2; attemptIndex++) {
-		try {
-			return await attempt();
-		} catch (error) {
-			lastError = error;
-			if (sessionSignal.aborted) throw error;
-		}
-	}
-	throw lastError;
 }
 
 function cleanOldProposals(paths: Paths, includeProject: boolean): void {
@@ -722,7 +616,17 @@ export default function skillEvolution(pi: ExtensionAPI) {
 				const item = reviewQueue.shift()!;
 				const combined = createReviewSignal(sessionAbort.signal);
 				try {
-					const proposals = await runReviewer(item.ctx, paths, config, item.runs, combined.signal);
+					const pipeline = createReviewPipeline({
+						paths,
+						config,
+						trustedProject: item.ctx.isProjectTrusted(),
+						authoringReference: loadAuthoringReference(paths),
+						model: ({ model, systemPrompt, prompt, signal }) => {
+							const selected = model ? { ...config, reviewModel: model } : config;
+							return completeJson(item.ctx, selected, systemPrompt, prompt, signal);
+						},
+					});
+					const proposals = await pipeline.review(item.runs, combined.signal);
 					if (proposals.length > 0 && item.ctx.hasUI) {
 						item.ctx.ui.notify(
 							`Skill evolution created ${proposals.length} proposal(s). Use /skill-evolution proposal list.`,
@@ -814,7 +718,7 @@ export default function skillEvolution(pi: ExtensionAPI) {
 		const record: RunRecord = {
 			index: nextRunIndex++,
 			timestamp: new Date().toISOString(),
-			text: serializeRun(pendingAgentMessages),
+			text: serializePipelineRun(pendingAgentMessages),
 		};
 		pendingAgentMessages = [];
 		pendingRuns.push(record);
