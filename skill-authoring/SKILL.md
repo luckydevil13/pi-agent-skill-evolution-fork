@@ -1,103 +1,74 @@
 ---
 name: skill-authoring
-description: Use when creating or updating a skill with skill_manage. Covers name rules, frontmatter, description writing, leading words, progressive disclosure, and when to split skills.
+description: Write and maintain agent skill packages safely.
+disable-model-invocation: true
 ---
 
 # Skill Authoring
 
-## Before writing — decide invocation mode
+Use this playbook when `/skill:skill-authoring` is invoked or when the isolated skill reviewer evaluates a proposal.
 
-- **Model-invoked** (default): keep the description; agent fires autonomously. Costs context load.
-- **User-invoked**: set `disable-model-invocation: true`; strip trigger phrasing from description. Zero context cost.
-- Pick model-invocation only when the agent must reach the skill on its own, or another skill must.
+## 1. Inspect before writing
 
-## Name rules
+Read the current `SKILL.md` and every package file that the proposed change touches. Check both `global` and `project` scope for the same skill name.
 
-- 1-64 characters, lowercase letters, digits, hyphens only
-- No leading/trailing/consecutive hyphens
-- Does NOT need to match parent directory (pi allows it)
+**Complete when:** the target scope, existing package, and every affected file are known.
 
-## Description (frontmatter `description`)
+## 2. Choose invocation mode
 
-Does two jobs: state what the skill is AND list branches that should trigger it.
+- **Model-invoked:** keep trigger branches in `description`.
+- **User-invoked:** set `disable-model-invocation: true` and use a human-facing one-line description.
+- Use model invocation only when the agent or another skill must discover the skill without a direct command.
 
-- **Front-load the leading word** — the description is where invocation happens
-- **One trigger per branch** — synonyms of one branch = duplication
-- **Cut identity already in the body**
-- ≤ 1024 characters
-- **YAML-safe** — the description lands in frontmatter. A bare `description:` followed
-  by a scalar containing `:` (colon+space) or a leading indicator (`#`, `-`, `[`, `{`,
-  `:`, `>`, `|`, `&`, `*`, `!`, `%`, `@`, backtick, quotes) breaks YAML and causes
-  a `Nested mappings are not allowed` warning at pi startup. Prefer phrasing that
-  avoids colons entirely (e.g. `Extracts tables from PDFs. Use when working with PDFs.`
-  instead of `Transactions: parse receipts`). If you must use a colon, wrap the whole
-  `description` value in double quotes: `description: "Parses receipts. Steps: read, classify."`
+**Complete when:** the proposal states the invocation mode and why it needs that mode.
 
-Good: `Extracts text and tables from PDFs. Use when working with PDF documents.`
-Bad: `Helps with PDFs.`
+## 3. Design the description
 
-## Information hierarchy
+For a model-invoked skill, the description is a context pointer:
 
-```
-1. In-skill step        — ordered action in SKILL.md, with completion criterion
-2. In-skill reference   — definition/rule in SKILL.md, consulted on demand
-3. External reference   — pushed behind a context pointer (linked .md file)
-```
+- State the capability.
+- Name one trigger per distinct branch.
+- Remove synonyms that repeat one branch.
+- Keep it at 1024 characters or less.
+- Quote it as a YAML scalar.
 
-Each step ends on a **completion criterion** — checkable and exhaustive. Vague criteria cause **premature completion**.
+Change `description` only when capability, trigger branches, or invocation mode changes.
 
-## Progressive disclosure
+**Complete when:** each trigger branch has one clear trigger and no duplicate wording.
 
-Push material behind context pointers when:
+## 4. Design the body
 
-- Only some branches reach it (split by branch)
-- A completion criterion would tempt the agent to skip ahead (split by sequence)
-- Reference material is long but needed on demand
+Order information by need:
 
-## Leading words
+1. Steps the agent performs.
+2. Reference rules used during those steps.
+3. External references needed by only some branches.
 
-Use compact pretrained concepts (`lesson`, `fog of war`, `tracer bullets`, `tight`, `red`) that anchor behavior with the fewest tokens. Reuse the same word in description AND body for reliable invocation.
+Every step must end with a checkable completion criterion. Keep definitions, rules, and caveats for one concept under one heading.
 
-## When to split
+**Complete when:** every step has a clear end condition and branch-only reference is behind a relative context pointer.
 
-- **By invocation**: distinct leading word that should trigger independently, or another skill must reach it
-- **By sequence**: when post-completion steps tempt premature completion on the current step
+## 5. Prune
 
-## Pruning
+Check the proposed package for:
 
-Check every line:
+- **Duplication:** one meaning has more than one source of truth.
+- **Sediment:** stale instructions remain after behavior changed.
+- **Sprawl:** the main file contains branch-specific reference.
+- **No-op:** an instruction does not change model behavior.
+- **Negation:** a prohibition can be replaced by a positive target behavior.
 
-1. **Single source of truth** — one authoritative place for each meaning
-2. **Relevance** — does it still bear on what the skill does?
-3. **No-op test** — does it change behavior vs the default? If no, delete it
+**Complete when:** each remaining instruction changes behavior and has one authoritative location.
 
-## Skill structure
+## Safe management workflow
 
-```
-skills/<name>/
-├── SKILL.md          # required: frontmatter + instructions
-├── GLOSSARY.md       # optional: definitions, linked from SKILL.md
-├── scripts/          # optional: helper scripts
-└── references/       # optional: detailed docs
-```
+`skill_evolve` reviews completed agent runs in isolated context and creates proposals. `skill_manage` applies approved proposals.
 
-## Using skill_manage
+- `list` and `inspect` are read operations.
+- A direct `patch` can change only one unique occurrence in the body of `SKILL.md`.
+- `create`, `edit`, frontmatter changes, package-file writes, and disable operations require a proposal.
+- `edit` preserves frontmatter fields that the proposal does not change.
+- `global` is for reusable workflows. `project` is for repository-specific rules.
+- Reload discovery data manually after create, description changes, invocation-mode changes, disable, or enable.
 
-| Operation | When |
-|-----------|------|
-| `create`  | Brand new skill, not yet written |
-| `edit`    | Full rewrite of an existing skill |
-| `patch`   | Small find-and-replace inside SKILL.md (prefer over edit) |
-| `delete`  | Remove a skill no longer needed |
-| `list`    | See all available skills |
-| `inspect` | Read current content of a skill before editing |
-
-**Order of preference**: patch the currently-loaded skill → patch an existing skill in the right category → create new.
-
-## Failure modes to avoid
-
-- **Premature completion** — fix with sharper completion criteria first, then sequence-split
-- **Duplication** — same meaning in >1 place
-- **Sediment** — stale layers that settled because adding felt safe
-- **Sprawl** — skill too long even when every line is live (cure: progressive disclosure + splitting)
-- **No-op** — line the model already obeys by default
+**Complete when:** the proposal has an explicit scope, affected files, and a reviewable diff.

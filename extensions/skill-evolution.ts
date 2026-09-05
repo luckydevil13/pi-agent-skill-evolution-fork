@@ -1,849 +1,1307 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
+import {
+	CONFIG_DIR_NAME,
+	type ExtensionAPI,
+	type ExtensionContext,
+	withFileMutationQueue,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
+	appendFileSync,
 	existsSync,
+	lstatSync,
 	mkdirSync,
 	readFileSync,
 	readdirSync,
+	realpathSync,
 	renameSync,
+	rmSync,
 	statSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
-/**
- * skill-evolution extension
- *
- * Gives the agent a first-class `skill_manage` tool for creating, editing,
- * patching, and deleting skills, then runs a post-turn review loop that
- * inspects each completed agent run and proactively saves noteworthy
- * workflows as skills.  Mirrors Hermes Agent's self-improvement loop.
- *
- * Also tracks skill usage statistics and provides weekly reminders about
- * inactive skills. Reminder can be toggled on/off persistently via the
- * /skill-evolution command.
- *
- * Usage:
- *   Place this file in ~/.pi/agent/extensions/skill-evolution.ts
- *   or .pi/extensions/skill-evolution.ts (project-local, trusted project).
- *   No settings changes required.  Skills are stored in
- *   ~/.pi/agent/skills/<name>/SKILL.md by default.
- */
+const REVIEW_GUARDRAIL =
+	"\n\n## Skill Evolution\nDo not create or fully rewrite skills directly. Skill creation, frontmatter changes, package-file changes, and disabling require a skill-evolution proposal.\n";
+const DEFAULT_REVIEW_INTERVAL = 10;
+const DEFAULT_MAX_PROPOSALS = 3;
+const DEFAULT_INACTIVE_DAYS = 30;
+const REMINDER_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
+const MAX_TOOL_OUTPUT_BYTES = 50 * 1024;
+const MAX_RUN_BYTES = 20 * 1024;
+const MAX_REVIEW_BYTES = 120 * 1024;
+const PROPOSAL_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const RUN_ENTRY_TYPE = "skill-evolution-run-v2";
+const REVIEW_STATE_ENTRY_TYPE = "skill-evolution-review-state-v2";
 
-const SKILL_GUIDANCE = `\n\n## Skill Evolution\nAfter completing a complex task (5+ tool calls), fixing a tricky error,\ndiscovering a non-trivial workflow, or recovering from an unexpected failure,\nsave the approach as a skill using the skill_manage tool so you can reuse it next time.\nWhen updating an existing skill, prefer skill_manage with operation "patch"\n(small find-and-replace) over a full rewrite.\nWhen in doubt, create a skill rather than letting a useful workflow be lost.\n`;
+const REVIEW_SYSTEM_PROMPT = `You are the isolated reviewer for skill evolution.
+Find reusable workflows in the supplied agent runs. Prefer updating an existing skill over creating a duplicate.
+A proposal is justified only when a workflow repeated, or when it captured a difficult error, recovery, or non-obvious sequence.
+Return JSON only. Do not use Markdown fences. Never include secrets.
+The final JSON is either {"status":"no_change","proposals":[]} or:
+{"status":"proposals","proposals":[{"title":"...","rationale":"...","scope":"global|project","operations":[...]}]}.
+Allowed operations:
+- {"type":"create","skillName":"...","description":"...","content":"SKILL.md body without frontmatter"}
+- {"type":"edit","skillName":"...","description":"optional replacement","content":"replacement SKILL.md body"}
+- {"type":"patch","skillName":"...","path":"SKILL.md or relative text path","find":"unique exact text","replace":"..."}
+- {"type":"write","skillName":"...","path":"relative text path","content":"..."}
+- {"type":"disable","skillName":"..."}
+Create at most the requested number of proposals. Use project scope for repository-specific rules and global scope for reusable workflows.`;
 
-// ─── Stats file constants ────────────────────────────────────────────
+const SELECTOR_SYSTEM_PROMPT = `Select existing skills that may cover the supplied workflows.
+Return JSON only as {"relevantSkills":["scope:name", ...]}.
+Select at most five. Return an empty array if no existing skill is relevant.`;
 
-const STATS_FILENAME = ".skill-stats.json";
-const INACTIVE_DAYS = 30;
-const REMINDER_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+interface ReviewConfig {
+	reviewModel?: string;
+	reviewInterval: number;
+	maxProposals: number;
+	inactiveDays: number;
+}
 
-interface SkillUsageEntry {
-	count: number;
-	lastUsed: string;
+interface SkillActivity {
 	created: string;
+	explicitInvocationCount: number;
+	lastExplicitInvocation: string | null;
+	skillLoadCount: number;
+	lastSkillLoad: string | null;
+	managementOperations: number;
+	lastManagementOperation: string | null;
 	description?: string;
 }
 
-interface SkillStats {
-	reminderEnabled: boolean;
+interface StatsFile {
+	version: 2;
+	reminderEnabled: boolean | null;
 	lastReminderCheck: string | null;
-	usage: Record<string, SkillUsageEntry>;
+	skills: Record<string, SkillActivity>;
 }
 
-function defaultStats(): SkillStats {
+type Scope = "global" | "project";
+type ProposalStatus = "pending" | "applied" | "rejected" | "stale";
+
+type ProposalOperation =
+	| {
+			type: "create";
+			skillName: string;
+			description: string;
+			content: string;
+			beforeHash?: string | null;
+	  }
+	| {
+			type: "edit";
+			skillName: string;
+			description?: string;
+			content: string;
+			beforeHash?: string | null;
+	  }
+	| {
+			type: "patch";
+			skillName: string;
+			path: string;
+			find: string;
+			replace: string;
+			beforeHash?: string | null;
+	  }
+	| {
+			type: "write";
+			skillName: string;
+			path: string;
+			content: string;
+			beforeHash?: string | null;
+	  }
+	| {
+			type: "disable";
+			skillName: string;
+			beforeHash?: string | null;
+	  };
+
+interface Proposal {
+	version: 1;
+	id: string;
+	title: string;
+	rationale: string;
+	scope: Scope;
+	status: ProposalStatus;
+	createdAt: string;
+	updatedAt: string;
+	operations: ProposalOperation[];
+}
+
+interface ReviewerDraft {
+	title: string;
+	rationale: string;
+	scope: Scope;
+	operations: ProposalOperation[];
+}
+
+interface RunRecord {
+	index: number;
+	timestamp: string;
+	text: string;
+}
+
+interface SkillRecord {
+	name: string;
+	description: string;
+	scope: Scope;
+	path: string;
+}
+
+interface Paths {
+	globalSkills: string;
+	projectSkills: string;
+	globalState: string;
+	projectState: string;
+}
+
+function defaultStats(): StatsFile {
 	return {
-		reminderEnabled: true,
+		version: 2,
+		reminderEnabled: null,
 		lastReminderCheck: null,
-		usage: {},
+		skills: {},
 	};
 }
 
-function getStatsPath(skillsDir: string): string {
-	return join(skillsDir, STATS_FILENAME);
+function defaultConfig(): ReviewConfig {
+	return {
+		reviewInterval: DEFAULT_REVIEW_INTERVAL,
+		maxProposals: DEFAULT_MAX_PROPOSALS,
+		inactiveDays: DEFAULT_INACTIVE_DAYS,
+	};
 }
 
-function readStats(skillsDir: string): SkillStats {
-	const path = getStatsPath(skillsDir);
-	if (!existsSync(path)) return defaultStats();
+function readJson<T>(path: string, fallback: T): T {
+	if (!existsSync(path)) return fallback;
 	try {
-		const raw = readFileSync(path, "utf-8");
-		const parsed = JSON.parse(raw) as Partial<SkillStats>;
-		return {
-			reminderEnabled: parsed.reminderEnabled ?? true,
-			lastReminderCheck: parsed.lastReminderCheck ?? null,
-			usage: parsed.usage ?? {},
-		};
+		return JSON.parse(readFileSync(path, "utf8")) as T;
 	} catch {
-		return defaultStats();
+		return fallback;
 	}
 }
 
-function writeStats(skillsDir: string, stats: SkillStats): void {
-	const path = getStatsPath(skillsDir);
-	mkdirSync(skillsDir, { recursive: true });
-	writeFileSync(path, JSON.stringify(stats, null, 2), "utf-8");
+function writeTextAtomic(path: string, content: string, mode = 0o600): void {
+	mkdirSync(dirname(path), { recursive: true });
+	const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+	writeFileSync(temporary, content, { encoding: "utf8", mode });
+	renameSync(temporary, path);
 }
 
-function recordSkillUsage(
-	skillsDir: string,
+function writeJsonAtomic(path: string, value: unknown): void {
+	writeTextAtomic(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+async function queuedWriteJson(path: string, value: unknown): Promise<void> {
+	await withFileMutationQueue(path, async () => writeJsonAtomic(path, value));
+}
+
+function getPaths(cwd: string): Paths {
+	const home = process.env.HOME ?? "/root";
+	const agentDir = join(home, ".pi", "agent");
+	return {
+		globalSkills: process.env.PI_SKILL_EVOLUTION_DIR ?? join(agentDir, "skills"),
+		projectSkills: join(cwd, ".agents", "skills"),
+		globalState: join(agentDir, "skill-evolution"),
+		projectState: join(cwd, CONFIG_DIR_NAME, "skill-evolution"),
+	};
+}
+
+function stateDir(paths: Paths, scope: Scope): string {
+	return scope === "global" ? paths.globalState : paths.projectState;
+}
+
+function skillsDir(paths: Paths, scope: Scope): string {
+	return scope === "global" ? paths.globalSkills : paths.projectSkills;
+}
+
+function statsPath(paths: Paths, scope: Scope): string {
+	return join(stateDir(paths, scope), "stats.json");
+}
+
+function proposalDir(paths: Paths, scope: Scope): string {
+	return join(stateDir(paths, scope), "proposals");
+}
+
+function auditPath(paths: Paths, scope: Scope): string {
+	return join(stateDir(paths, scope), "audit.jsonl");
+}
+
+function readConfig(paths: Paths, includeProject: boolean): ReviewConfig {
+	const globalConfig = readJson<Partial<ReviewConfig>>(join(paths.globalState, "config.json"), {});
+	const projectConfig = includeProject
+		? readJson<Partial<ReviewConfig>>(join(paths.projectState, "config.json"), {})
+		: {};
+	const merged = { ...defaultConfig(), ...globalConfig, ...projectConfig };
+	return {
+		reviewModel: merged.reviewModel,
+		reviewInterval: Math.max(1, Math.floor(merged.reviewInterval ?? DEFAULT_REVIEW_INTERVAL)),
+		maxProposals: Math.max(1, Math.min(3, Math.floor(merged.maxProposals ?? DEFAULT_MAX_PROPOSALS))),
+		inactiveDays: Math.max(1, Math.floor(merged.inactiveDays ?? DEFAULT_INACTIVE_DAYS)),
+	};
+}
+
+function readStats(paths: Paths, scope: Scope): StatsFile {
+	const parsed = readJson<Partial<StatsFile>>(statsPath(paths, scope), {});
+	if (parsed.version !== 2) return defaultStats();
+	return {
+		version: 2,
+		reminderEnabled: parsed.reminderEnabled ?? null,
+		lastReminderCheck: parsed.lastReminderCheck ?? null,
+		skills: parsed.skills ?? {},
+	};
+}
+
+async function updateStats(
+	paths: Paths,
+	scope: Scope,
 	skillName: string,
-	_operation: string,
+	event: "explicitInvocation" | "skillLoad" | "management",
 	description?: string,
-): void {
-	const stats = readStats(skillsDir);
-	const now = new Date().toISOString();
-	const entry = stats.usage[skillName];
-	if (entry) {
-		entry.count += 1;
-		entry.lastUsed = now;
-		if (description) entry.description = description;
-	} else {
-		stats.usage[skillName] = {
-			count: 1,
-			lastUsed: now,
+): Promise<void> {
+	const path = statsPath(paths, scope);
+	await withFileMutationQueue(path, async () => {
+		const stats = readStats(paths, scope);
+		const now = new Date().toISOString();
+		const entry = stats.skills[skillName] ?? {
 			created: now,
-			description,
+			explicitInvocationCount: 0,
+			lastExplicitInvocation: null,
+			skillLoadCount: 0,
+			lastSkillLoad: null,
+			managementOperations: 0,
+			lastManagementOperation: null,
 		};
-	}
-	writeStats(skillsDir, stats);
-}
-
-function getInactiveSkills(
-	skillsDir: string,
-	stats: SkillStats,
-): Array<{ name: string; entry: SkillUsageEntry }> {
-	const now = Date.now();
-	const cutoff = now - INACTIVE_DAYS * 24 * 60 * 60 * 1000;
-	const inactive: Array<{ name: string; entry: SkillUsageEntry }> = [];
-
-	if (!existsSync(skillsDir)) return inactive;
-	const skillDirs = readdirSync(skillsDir).filter((f) => {
-		if (f === STATS_FILENAME || f.startsWith(".disabled-")) return false;
-		const fp = join(skillsDir, f);
-		return statSync(fp).isDirectory();
-	});
-
-	for (const name of skillDirs) {
-		const entry = stats.usage[name];
-		if (!entry) {
-			inactive.push({
-				name,
-				entry: {
-					count: 0,
-					lastUsed: new Date(0).toISOString(),
-					created: new Date(0).toISOString(),
-				},
-			});
-		} else if (new Date(entry.lastUsed).getTime() < cutoff) {
-			inactive.push({ name, entry });
+		if (event === "explicitInvocation") {
+			entry.explicitInvocationCount += 1;
+			entry.lastExplicitInvocation = now;
+		} else if (event === "skillLoad") {
+			entry.skillLoadCount += 1;
+			entry.lastSkillLoad = now;
+		} else {
+			entry.managementOperations += 1;
+			entry.lastManagementOperation = now;
 		}
-	}
-
-	inactive.sort(
-		(a, b) =>
-			new Date(a.entry.lastUsed).getTime() - new Date(b.entry.lastUsed).getTime(),
-	);
-
-	return inactive;
+		if (description) entry.description = description;
+		stats.skills[skillName] = entry;
+		writeJsonAtomic(path, stats);
+	});
 }
 
-function formatDaysAgo(isoDate: string): string {
-	const diff = Date.now() - new Date(isoDate).getTime();
-	const days = Math.floor(diff / (1000 * 60 * 60 * 24));
-	if (days === 0) return "today";
-	if (days === 1) return "1 day ago";
-	return `${days} days ago`;
-}
-
-function parseFrontmatter(text: string): {
-	name?: string;
-	description?: string;
-	raw: string;
-} {
-	const m = text.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
-	if (!m) return { raw: text };
-	const fm: Record<string, string> = {};
-	for (const line of m[1].split("\n")) {
-		const idx = line.indexOf(":");
-		if (idx < 0) continue;
-		const k = line.slice(0, idx).trim().toLowerCase();
-		fm[k] = line.slice(idx + 1).trim();
-	}
-	return { name: fm.name, description: fm.description, raw: m[2] };
-}
-
-/**
- * Escape a skill description so it is safe as a YAML frontmatter scalar.
- * A bare description containing a colon followed by a space (or starting on
- * special YAML indicators) would be parsed as a nested mapping and break the
- * frontmatter, producing a "Nested mappings are not allowed" warning at pi
- * startup. Wrap it in double quotes (escaping backslashes and quotes) when any
- * such character is present, so descriptions freely use "Covers:", colons, #,
- * quotes, curly braces, etc.
- */
-function yamlSafeScalar(value: string, forceQuote: boolean): string {
-	// Characters that force double-quoting in a plain YAML scalar:
-	//   ": " (colon + space), leading indicator chars, or structural symbols.
-	const needsQuote =
-		forceQuote ||
-		/[:]\s/.test(value) ||
-		/^[-?:,[\]{}#&*!|>'"%@`]/u.test(value) ||
-		/[[\]{}&*!|'"%@`]/.test(value);
-	if (!needsQuote) return value.trim();
-	const escaped = value.trim().replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-	// Also guard control characters that are invalid inside a double-quoted scalar.
-	const sanitized = escaped.replace(
-		/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g,
-		" ",
-	);
-	return `"${sanitized}"`;
-}
-
-function buildSkillMd(name: string, description: string, body: string): string {
-	return `---\nname: ${name}\ndescription: ${yamlSafeScalar(description, false)}\n---\n\n${body.trim()}\n`;
+function truncateText(text: string, maxBytes = MAX_TOOL_OUTPUT_BYTES): string {
+	if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+	let result = text.slice(0, maxBytes);
+	while (Buffer.byteLength(result, "utf8") > maxBytes) result = result.slice(0, -1);
+	return `${result}\n\n[Output truncated at ${maxBytes} bytes.]`;
 }
 
 function validateName(name: string): string | null {
 	if (!name || name.length > 64) return "Name must be 1-64 characters";
-	if (!/^[a-z0-9-]+$/.test(name))
-		return "Name must be lowercase letters, digits, hyphen only";
-	if (name.startsWith("-") || name.endsWith("-"))
-		return "Name must not start or end with hyphen";
+	if (!/^[a-z0-9-]+$/.test(name)) return "Name must contain lowercase letters, digits, and hyphens only";
+	if (name.startsWith("-") || name.endsWith("-")) return "Name must not start or end with a hyphen";
 	if (name.includes("--")) return "Name must not contain consecutive hyphens";
 	return null;
 }
 
-function listSkills(skillsDir: string) {
-	if (!existsSync(skillsDir)) {
-		return {
-			content: [
-				{
-					type: "text" as const,
-					text: "No skills directory found. Skills will be created in: " + skillsDir,
-				},
-			],
-			details: {},
-		};
-	}
-	const entries = readdirSync(skillsDir).filter((f) => {
-		const fp = join(skillsDir, f);
-		return (
-			statSync(fp).isDirectory() &&
-			!f.startsWith(".disabled-") &&
-			f !== STATS_FILENAME
-		);
-	});
-	const list = entries.map((dir) => {
-		const fp = join(skillsDir, dir, "SKILL.md");
-		if (existsSync(fp)) {
-			const text = readFileSync(fp, "utf-8");
-			const fm = parseFrontmatter(text);
-			return `- **${fm.name ?? dir}**: ${fm.description ?? "(no description)"}`;
+function requireValidName(name: string | undefined): string {
+	if (!name) throw new Error('Missing "skillName"');
+	const error = validateName(name);
+	if (error) throw new Error(`Invalid skill name "${name}": ${error}`);
+	return name;
+}
+
+function yamlSafeScalar(value: string): string {
+	const trimmed = value.trim().replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, " ");
+	return JSON.stringify(trimmed);
+}
+
+function buildSkillMd(name: string, description: string, body: string): string {
+	return `---\nname: ${name}\ndescription: ${yamlSafeScalar(description)}\n---\n\n${body.trim()}\n`;
+}
+
+function splitSkillMd(text: string): { frontmatter: string; body: string } {
+	const match = text.match(/^(---\r?\n[\s\S]*?\r?\n---\r?\n)([\s\S]*)$/);
+	if (!match) throw new Error("SKILL.md has invalid or missing frontmatter");
+	return { frontmatter: match[1], body: match[2] };
+}
+
+function replaceDescription(frontmatter: string, description: string): string {
+	const lines = frontmatter.split(/\r?\n/);
+	const index = lines.findIndex((line) => /^description\s*:/.test(line));
+	if (index < 0) throw new Error("SKILL.md frontmatter has no description");
+	lines[index] = `description: ${yamlSafeScalar(description)}`;
+	return lines.join("\n");
+}
+
+function editSkillMd(text: string, description: string | undefined, body: string): string {
+	const split = splitSkillMd(text);
+	const frontmatter = description ? replaceDescription(split.frontmatter, description) : split.frontmatter;
+	return `${frontmatter}${body.trim()}\n`;
+}
+
+function parseFrontmatter(text: string): { name?: string; description?: string; body: string } {
+	const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/);
+	if (!match) return { body: text };
+	const values: Record<string, string> = {};
+	for (const line of match[1].split(/\r?\n/)) {
+		const colon = line.indexOf(":");
+		if (colon < 0) continue;
+		const key = line.slice(0, colon).trim().toLowerCase();
+		let value = line.slice(colon + 1).trim();
+		try {
+			if (value.startsWith('"')) value = JSON.parse(value) as string;
+		} catch {
+			// Keep the raw scalar for display.
 		}
-		return `- ${dir}`;
+		values[key] = value;
+	}
+	return { name: values.name, description: values.description, body: match[2] };
+}
+
+function hashText(text: string): string {
+	return createHash("sha256").update(text).digest("hex");
+}
+
+function fileHash(path: string): string | null {
+	return existsSync(path) && statSync(path).isFile() ? hashText(readFileSync(path, "utf8")) : null;
+}
+
+function assertInside(root: string, candidate: string): void {
+	const rel = relative(resolve(root), resolve(candidate));
+	if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+		throw new Error(`Path escapes skill package: ${candidate}`);
+	}
+}
+
+function safePackagePath(root: string, relativePath: string): string {
+	if (!relativePath || isAbsolute(relativePath) || relativePath.split(/[\\/]+/).includes("..")) {
+		throw new Error(`Unsafe package path: ${relativePath}`);
+	}
+	const target = resolve(root, relativePath);
+	assertInside(root, target);
+
+	let current = root;
+	for (const part of relative(root, target).split(sep).filter(Boolean)) {
+		current = join(current, part);
+		if (!existsSync(current)) break;
+		if (lstatSync(current).isSymbolicLink()) {
+			const actual = realpathSync(current);
+			assertInside(root, actual);
+		}
+	}
+	return target;
+}
+
+function skillDirectory(paths: Paths, scope: Scope, skillName: string): string {
+	return join(skillsDir(paths, scope), requireValidName(skillName));
+}
+
+function operationPath(paths: Paths, scope: Scope, operation: ProposalOperation): string {
+	const root = skillDirectory(paths, scope, operation.skillName);
+	if (operation.type === "create" || operation.type === "edit" || operation.type === "disable") {
+		return join(root, "SKILL.md");
+	}
+	return safePackagePath(root, operation.path);
+}
+
+function withQueues<T>(paths: string[], work: () => Promise<T>, index = 0): Promise<T> {
+	const unique = [...new Set(paths.map((path) => resolve(path)))].sort();
+	const acquire = (position: number): Promise<T> => {
+		if (position >= unique.length) return work();
+		return withFileMutationQueue(unique[position], () => acquire(position + 1));
+	};
+	return acquire(index);
+}
+
+function readProposal(path: string): Proposal {
+	const proposal = readJson<Proposal | null>(path, null);
+	if (!proposal || proposal.version !== 1 || !proposal.id) throw new Error(`Invalid proposal file: ${path}`);
+	return proposal;
+}
+
+function findProposal(paths: Paths, id: string, includeProject: boolean): { path: string; proposal: Proposal } {
+	const matches: Array<{ path: string; proposal: Proposal }> = [];
+	const scopes: Scope[] = includeProject ? ["global", "project"] : ["global"];
+	for (const scope of scopes) {
+		const path = join(proposalDir(paths, scope), `${id}.json`);
+		if (existsSync(path)) matches.push({ path, proposal: readProposal(path) });
+	}
+	if (matches.length === 0) throw new Error(`Proposal "${id}" was not found`);
+	if (matches.length > 1) throw new Error(`Proposal ID "${id}" is ambiguous`);
+	return matches[0];
+}
+
+function listProposals(paths: Paths, includeProject: boolean): Array<{ path: string; proposal: Proposal }> {
+	const result: Array<{ path: string; proposal: Proposal }> = [];
+	const scopes: Scope[] = includeProject ? ["global", "project"] : ["global"];
+	for (const scope of scopes) {
+		const dir = proposalDir(paths, scope);
+		if (!existsSync(dir)) continue;
+		for (const name of readdirSync(dir).filter((entry) => entry.endsWith(".json")).sort()) {
+			const path = join(dir, name);
+			try {
+				result.push({ path, proposal: readProposal(path) });
+			} catch {
+				// Ignore malformed proposal files in list output.
+			}
+		}
+	}
+	return result.sort((a, b) => b.proposal.createdAt.localeCompare(a.proposal.createdAt));
+}
+
+function proposalSummary(proposal: Proposal): string {
+	const operations = proposal.operations
+		.map((operation) => {
+			const path = operation.type === "patch" || operation.type === "write" ? `/${operation.path}` : "";
+			return `  - ${operation.type} ${operation.skillName}${path}`;
+		})
+		.join("\n");
+	return `# ${proposal.title}\n\nID: ${proposal.id}\nStatus: ${proposal.status}\nScope: ${proposal.scope}\nCreated: ${proposal.createdAt}\n\n${proposal.rationale}\n\nOperations:\n${operations}`;
+}
+
+function attachHashes(paths: Paths, draft: ReviewerDraft): ProposalOperation[] {
+	return draft.operations.map((operation) => ({
+		...operation,
+		beforeHash: fileHash(operationPath(paths, draft.scope, operation)),
+	}));
+}
+
+async function saveProposal(paths: Paths, draft: ReviewerDraft, includeProject: boolean): Promise<Proposal> {
+	if (draft.scope !== "global" && draft.scope !== "project") throw new Error("Proposal has invalid scope");
+	if (!draft.operations?.length) throw new Error("Proposal has no operations");
+	for (const operation of draft.operations) requireValidName(operation.skillName);
+
+	const duplicate = listProposals(paths, includeProject).find(
+		({ proposal }) =>
+			proposal.status === "pending" &&
+			proposal.scope === draft.scope &&
+			JSON.stringify(proposal.operations) === JSON.stringify(attachHashes(paths, draft)),
+	);
+	if (duplicate) return duplicate.proposal;
+
+	const now = new Date().toISOString();
+	const proposal: Proposal = {
+		version: 1,
+		id: randomUUID(),
+		title: draft.title,
+		rationale: draft.rationale,
+		scope: draft.scope,
+		status: "pending",
+		createdAt: now,
+		updatedAt: now,
+		operations: attachHashes(paths, draft),
+	};
+	const path = join(proposalDir(paths, proposal.scope), `${proposal.id}.json`);
+	await queuedWriteJson(path, proposal);
+	return proposal;
+}
+
+async function appendAudit(paths: Paths, scope: Scope, record: Record<string, unknown>): Promise<void> {
+	const path = auditPath(paths, scope);
+	await withFileMutationQueue(path, async () => {
+		mkdirSync(dirname(path), { recursive: true });
+		appendFileSync(path, `${JSON.stringify({ timestamp: new Date().toISOString(), ...record })}\n`, {
+			encoding: "utf8",
+			mode: 0o600,
+		});
 	});
+}
+
+function assertProposalFresh(paths: Paths, proposal: Proposal): void {
+	for (const operation of proposal.operations) {
+		const current = fileHash(operationPath(paths, proposal.scope, operation));
+		if (current !== (operation.beforeHash ?? null)) {
+			throw new Error(`Proposal is stale for ${operation.skillName} (${operation.type})`);
+		}
+	}
+}
+
+function validateOperationMinimal(
+	paths: Paths,
+	scope: Scope,
+	operation: ProposalOperation,
+	createdSkills: Set<string>,
+	includeProject: boolean,
+): void {
+	const error = validateName(operation.skillName);
+	if (error) throw new Error(error);
+	const skillMd = join(skillDirectory(paths, scope, operation.skillName), "SKILL.md");
+	if (operation.type === "create") {
+		if (!operation.description.trim()) throw new Error("Create requires a description");
+		if (!operation.content.trim()) throw new Error("Create requires a non-empty body");
+		const collision = discoverSkills(paths).find(
+			(skill) => skill.name === operation.skillName && (includeProject || skill.scope === "global"),
+		);
+		if (collision) throw new Error(`Skill name "${operation.skillName}" already exists in ${collision.scope} scope`);
+		return;
+	}
+	if (!existsSync(skillMd) && !(operation.type === "write" && createdSkills.has(operation.skillName))) {
+		throw new Error(`Skill "${operation.skillName}" has no SKILL.md`);
+	}
+	if (operation.type === "edit" && !operation.content.trim()) throw new Error("Edit requires a non-empty body");
+	if (operation.type === "patch" && !operation.find) throw new Error("Patch requires non-empty find text");
+}
+
+async function applyProposal(
+	paths: Paths,
+	proposalPath: string,
+	proposal: Proposal,
+	includeProject: boolean,
+): Promise<void> {
+	if (proposal.status !== "pending") throw new Error(`Proposal is ${proposal.status}, not pending`);
+	const targets = proposal.operations.map((operation) => operationPath(paths, proposal.scope, operation));
+	await withQueues([...targets, proposalPath], async () => {
+		try {
+			assertProposalFresh(paths, proposal);
+		} catch (error) {
+			proposal.status = "stale";
+			proposal.updatedAt = new Date().toISOString();
+			writeJsonAtomic(proposalPath, proposal);
+			throw error;
+		}
+		const createdSkills = new Set(
+			proposal.operations.filter((operation) => operation.type === "create").map((operation) => operation.skillName),
+		);
+		for (const operation of proposal.operations) {
+			validateOperationMinimal(paths, proposal.scope, operation, createdSkills, includeProject);
+		}
+
+		const snapshots = new Map<string, { existed: boolean; content?: string }>();
+		const createdSkillDirs = new Set<string>();
+		const disabledRenames: Array<{ from: string; to: string }> = [];
+		try {
+			for (const operation of proposal.operations) {
+				const root = skillDirectory(paths, proposal.scope, operation.skillName);
+				const rootExisted = existsSync(root);
+				if (!rootExisted) createdSkillDirs.add(root);
+				const target = operationPath(paths, proposal.scope, operation);
+				if (!snapshots.has(target)) {
+					snapshots.set(target, {
+						existed: existsSync(target),
+						content: existsSync(target) && statSync(target).isFile() ? readFileSync(target, "utf8") : undefined,
+					});
+				}
+
+				if (operation.type === "create") {
+					if (existsSync(target)) throw new Error(`Skill "${operation.skillName}" already exists`);
+					mkdirSync(root, { recursive: true });
+					writeTextAtomic(target, buildSkillMd(operation.skillName, operation.description, operation.content));
+				} else if (operation.type === "edit") {
+					const current = readFileSync(target, "utf8");
+					writeTextAtomic(target, editSkillMd(current, operation.description, operation.content));
+				} else if (operation.type === "patch") {
+					const current = readFileSync(target, "utf8");
+					const count = current.split(operation.find).length - 1;
+					if (count !== 1) throw new Error(`Patch find text occurs ${count} times in ${operation.path}`);
+					writeTextAtomic(target, current.replace(operation.find, operation.replace));
+				} else if (operation.type === "write") {
+					mkdirSync(dirname(target), { recursive: true });
+					writeTextAtomic(target, operation.content);
+				} else {
+					const disabled = join(skillsDir(paths, proposal.scope), `.disabled-${operation.skillName}`);
+					if (existsSync(disabled)) throw new Error(`Disabled target already exists: ${disabled}`);
+					renameSync(root, disabled);
+					disabledRenames.push({ from: root, to: disabled });
+				}
+			}
+
+			proposal.status = "applied";
+			proposal.updatedAt = new Date().toISOString();
+			writeJsonAtomic(proposalPath, proposal);
+		} catch (error) {
+			for (const rename of disabledRenames.reverse()) {
+				if (existsSync(rename.to) && !existsSync(rename.from)) renameSync(rename.to, rename.from);
+			}
+			for (const [path, snapshot] of [...snapshots.entries()].reverse()) {
+				if (snapshot.existed && snapshot.content !== undefined) {
+					mkdirSync(dirname(path), { recursive: true });
+					writeTextAtomic(path, snapshot.content);
+				} else if (!snapshot.existed && existsSync(path) && statSync(path).isFile()) {
+					unlinkSync(path);
+				}
+			}
+			for (const dir of createdSkillDirs) {
+				if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+			}
+			throw error;
+		}
+	});
+
+	for (const operation of proposal.operations) {
+		await updateStats(paths, proposal.scope, operation.skillName, "management");
+	}
+	await appendAudit(paths, proposal.scope, {
+		action: "apply-proposal",
+		proposalId: proposal.id,
+		operations: proposal.operations.map((operation) => ({
+			type: operation.type,
+			skillName: operation.skillName,
+			beforeHash: operation.beforeHash ?? null,
+			afterHash: fileHash(operationPath(paths, proposal.scope, operation)),
+		})),
+	});
+}
+
+async function safeBodyPatch(
+	paths: Paths,
+	scope: Scope,
+	skillName: string,
+	find: string,
+	replace: string,
+): Promise<string> {
+	const path = join(skillDirectory(paths, scope, skillName), "SKILL.md");
+	return withFileMutationQueue(path, async () => {
+		if (!existsSync(path)) throw new Error(`Skill "${skillName}" was not found`);
+		const current = readFileSync(path, "utf8");
+		const before = splitSkillMd(current);
+		const count = before.body.split(find).length - 1;
+		if (count !== 1) throw new Error(`Patch find text occurs ${count} times in SKILL.md body`);
+		const next = `${before.frontmatter}${before.body.replace(find, replace)}`;
+		if (splitSkillMd(next).frontmatter !== before.frontmatter) throw new Error("Automatic patch cannot change frontmatter");
+		writeTextAtomic(path, next);
+		await appendAudit(paths, scope, {
+			action: "automatic-body-patch",
+			skillName,
+			beforeHash: hashText(current),
+			afterHash: hashText(next),
+			diff: { find, replace },
+		});
+		await updateStats(paths, scope, skillName, "management");
+		return path;
+	});
+}
+
+function loadAuthoringReference(paths: Paths): string {
+	const candidates = [
+		join(paths.globalSkills, "skill-authoring", "SKILL.md"),
+		join(paths.projectSkills, "skill-authoring", "SKILL.md"),
+	];
+	for (const path of candidates) {
+		if (existsSync(path)) return truncateText(readFileSync(path, "utf8"), 20 * 1024);
+	}
+	return [
+		"Write ordered steps with checkable completion criteria.",
+		"Preserve one source of truth and existing frontmatter fields.",
+		"Prefer patching an existing skill over creating a duplicate.",
+		"Change description only when capability, trigger branches, or invocation mode changes.",
+		"Move branch-only reference behind a relative context pointer.",
+	].join("\\n");
+}
+
+function discoverSkills(paths: Paths): SkillRecord[] {
+	const result: SkillRecord[] = [];
+	for (const scope of ["global", "project"] as const) {
+		const root = skillsDir(paths, scope);
+		if (!existsSync(root)) continue;
+		for (const directory of readdirSync(root).sort()) {
+			if (directory.startsWith(".disabled-")) continue;
+			const path = join(root, directory, "SKILL.md");
+			if (!existsSync(path)) continue;
+			try {
+				const parsed = parseFrontmatter(readFileSync(path, "utf8"));
+				result.push({
+					name: parsed.name ?? directory,
+					description: parsed.description ?? "",
+					scope,
+					path,
+				});
+			} catch {
+				// Ignore unreadable entries in discovery output.
+			}
+		}
+	}
+	return result;
+}
+
+function resolveSkill(paths: Paths, skillName: string, requestedScope?: Scope): SkillRecord {
+	const matches = discoverSkills(paths).filter(
+		(skill) => skill.name === skillName && (!requestedScope || skill.scope === requestedScope),
+	);
+	if (matches.length === 0) throw new Error(`Skill "${skillName}" was not found`);
+	if (matches.length > 1) throw new Error(`Skill "${skillName}" exists in both scopes; specify scope`);
+	return matches[0];
+}
+
+function redactText(text: string): string {
+	return text
+		.replace(/data:[^;\s]+;base64,[A-Za-z0-9+/=]+/g, "[image removed]")
+		.replace(/\b(?:sk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{16,}\b/g, "[secret removed]")
+		.replace(/(api[_-]?key|token|password|secret)\s*[:=]\s*[^\s,;]+/gi, "$1=[secret removed]");
+}
+
+function serializeRun(messages: unknown[]): string {
+	const text = redactText(
+		JSON.stringify(messages, (_key, value) => {
+			if (value && typeof value === "object" && (value as { type?: string }).type === "image") return "[image removed]";
+			if (typeof value === "string" && value.length > 4000) return `${value.slice(0, 4000)}…[truncated]`;
+			return value;
+		}),
+	);
+	return truncateText(text, MAX_RUN_BYTES);
+}
+
+function extractTextResponse(response: { content: Array<{ type: string; text?: string }> }): string {
+	return response.content
+		.filter((part) => part.type === "text")
+		.map((part) => part.text ?? "")
+		.join("\n")
+		.trim();
+}
+
+function parseJsonResponse<T>(text: string): T {
+	const unfenced = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+	const start = unfenced.indexOf("{");
+	const end = unfenced.lastIndexOf("}");
+	if (start < 0 || end < start) throw new Error("Reviewer returned no JSON object");
+	return JSON.parse(unfenced.slice(start, end + 1)) as T;
+}
+
+function selectReviewModel(ctx: ExtensionContext, config: ReviewConfig) {
+	if (config.reviewModel) {
+		const slash = config.reviewModel.indexOf("/");
+		if (slash > 0) {
+			const model = ctx.modelRegistry.find(config.reviewModel.slice(0, slash), config.reviewModel.slice(slash + 1));
+			if (model && ctx.modelRegistry.hasConfiguredAuth(model)) return model;
+		}
+	}
+	return ctx.model;
+}
+
+function createReviewSignal(parent: AbortSignal): { signal: AbortSignal; cleanup: () => void } {
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), 120_000);
+	const abort = () => controller.abort();
+	parent.addEventListener("abort", abort, { once: true });
 	return {
-		content: [
-			{
-				type: "text" as const,
-				text: `Found ${list.length} skill(s) in ${skillsDir}:\n\n${list.join("\n")}`,
-			},
-		],
-		details: { skillDir: skillsDir, count: list.length },
+		signal: controller.signal,
+		cleanup: () => {
+			clearTimeout(timeout);
+			parent.removeEventListener("abort", abort);
+		},
 	};
 }
 
-function inactiveReportLines(
-	inactive: Array<{ name: string; entry: SkillUsageEntry }>,
-): string[] {
-	const lines: string[] = [];
-	lines.push(
-		"\u{200b}📊 **Skill Evolution: Inactive Skills Report**",
-		"",
-		`The following ${inactive.length} skill(s) have been inactive for over ${INACTIVE_DAYS} days.`,
-		"Consider disabling or removing them if they're no longer needed:",
-		"",
+async function completeJson(
+	ctx: ExtensionContext,
+	config: ReviewConfig,
+	systemPrompt: string,
+	prompt: string,
+	signal: AbortSignal,
+): Promise<string> {
+	const model = selectReviewModel(ctx, config);
+	if (!model) throw new Error("No reviewer model is available");
+	const response = await ctx.modelRegistry.complete(
+		model,
+		{
+			systemPrompt,
+			messages: [
+				{
+					role: "user" as const,
+					content: [{ type: "text" as const, text: prompt }],
+					timestamp: Date.now(),
+				},
+			],
+		},
+		{
+			maxTokens: 4096,
+			signal,
+			cacheRetention: "none",
+			sessionId: randomUUID(),
+		},
 	);
-	for (const { name, entry } of inactive) {
-		const desc = entry.description ? ` — ${entry.description}` : "";
-		const lastUsed =
-			entry.lastUsed && entry.lastUsed !== new Date(0).toISOString()
-				? ` (last used ${formatDaysAgo(entry.lastUsed)})`
-				: " (never used in recorded stats)";
-		lines.push(`- **${name}**${desc}${lastUsed}`);
-	}
-	lines.push(
-		"",
-		"To disable a skill, use `/skill-evolution disable <name>` or remove its directory.",
-		"To re-enable: `/skill-evolution enable <name>`",
-		`To turn off these reminders: \`/skill-evolution reminder off\``,
-		`To check manually: \`/skill-evolution inactive\` or \`/skill-evolution reminder check\``,
-	);
-	return lines;
+	return extractTextResponse(response);
 }
 
-function buildReminderText(enabled: boolean, lastCheck: string | null): string {
-	const status = enabled ? "✅ ON" : "🛑 OFF";
-	const check = lastCheck
-		? `Last check: ${new Date(lastCheck).toLocaleString()}`
-		: "No check performed yet";
-	return `Reminder: ${status} | ${check}`;
-}
+async function runReviewer(
+	ctx: ExtensionContext,
+	paths: Paths,
+	config: ReviewConfig,
+	runs: RunRecord[],
+	sessionSignal: AbortSignal,
+): Promise<Proposal[]> {
+	const reviewText = truncateText(
+		runs.map((run) => `## Run ${run.index} (${run.timestamp})\n${run.text}`).join("\n\n"),
+		MAX_REVIEW_BYTES,
+	);
+	const catalog = discoverSkills(paths).filter((skill) => skill.scope === "global" || ctx.isProjectTrusted());
+	const catalogText = catalog
+		.map((skill) => `- ${skill.scope}:${skill.name} — ${skill.description}`)
+		.join("\n");
 
-function buildStatsReport(skillsDir: string, stats: SkillStats): string[] {
-	const allSkillNames = existsSync(skillsDir)
-		? readdirSync(skillsDir).filter((f) => {
-				if (
-					f === STATS_FILENAME ||
-					f.startsWith(".disabled-") ||
-					!statSync(join(skillsDir, f)).isDirectory()
-				)
-					return false;
-				return true;
-			})
-		: [];
+	const attempt = async (): Promise<Proposal[]> => {
+		const selectionText = await completeJson(
+			ctx,
+			config,
+			SELECTOR_SYSTEM_PROMPT,
+			`Existing skills:\n${catalogText || "(none)"}\n\nAgent runs:\n${reviewText}`,
+			sessionSignal,
+		);
+		const selection = parseJsonResponse<{ relevantSkills?: string[] }>(selectionText);
+		const relevant = new Set((selection.relevantSkills ?? []).slice(0, 5));
+		const bodies = catalog
+			.filter((skill) => relevant.has(`${skill.scope}:${skill.name}`))
+			.map((skill) => `## ${skill.scope}:${skill.name}\n${truncateText(readFileSync(skill.path, "utf8"), 20 * 1024)}`)
+			.join("\n\n");
 
-	const lines: string[] = [
-		"📊 **Skill Usage Statistics**",
-		"",
-		`Total skills on disk: ${allSkillNames.length}`,
-		`Tracked in stats: ${Object.keys(stats.usage).length}`,
-		`Reminder: ${stats.reminderEnabled ? "✅ ON" : "🛑 OFF"}`,
-		`Last reminder check: ${stats.lastReminderCheck ? new Date(stats.lastReminderCheck).toLocaleString() : "never"}`,
-		"",
-		"--- Per-Skill Usage ---",
-	];
+		const finalText = await completeJson(
+			ctx,
+			config,
+			REVIEW_SYSTEM_PROMPT,
+			`Maximum proposals: ${config.maxProposals}\n\nAuthoring reference:\n${loadAuthoringReference(paths)}\n\nExisting skill catalog:\n${catalogText || "(none)"}\n\nRelevant skill bodies:\n${bodies || "(none selected)"}\n\nAgent runs:\n${reviewText}`,
+			sessionSignal,
+		);
+		const result = parseJsonResponse<{ status?: string; proposals?: ReviewerDraft[] }>(finalText);
+		if (result.status === "no_change" || !result.proposals?.length) return [];
+		const drafts = result.proposals.slice(0, config.maxProposals);
+		const proposals: Proposal[] = [];
+		for (const draft of drafts) {
+			if (draft.scope === "project" && !ctx.isProjectTrusted()) continue;
+			proposals.push(await saveProposal(paths, draft, ctx.isProjectTrusted()));
+		}
+		return proposals;
+	};
 
-	const allNames = new Set([...allSkillNames, ...Object.keys(stats.usage)]);
-	const sorted = [...allNames].sort();
-	for (const name of sorted) {
-		const entry = stats.usage[name];
-		const onDisk = allSkillNames.includes(name);
-		if (entry) {
-			const desc = entry.description ? ` — ${entry.description}` : "";
-			lines.push(
-				`- **${name}**${desc}: ${entry.count} use(s), last ${formatDaysAgo(entry.lastUsed)}${onDisk ? "" : " (⚠️ deleted from disk)"}`,
-			);
-		} else {
-			lines.push(`- **${name}**: (no stats tracked yet)`);
+	let lastError: unknown;
+	for (let attemptIndex = 0; attemptIndex < 2; attemptIndex++) {
+		try {
+			return await attempt();
+		} catch (error) {
+			lastError = error;
+			if (sessionSignal.aborted) throw error;
 		}
 	}
-	return lines;
+	throw lastError;
 }
 
-export default function (pi: ExtensionAPI) {
-	const SKILLS_DIR =
-		process.env.PI_SKILL_EVOLUTION_DIR ??
-		join(process.env.HOME ?? "/root", ".pi", "agent", "skills");
+function cleanOldProposals(paths: Paths, includeProject: boolean): void {
+	const cutoff = Date.now() - PROPOSAL_RETENTION_MS;
+	for (const { path, proposal } of listProposals(paths, includeProject)) {
+		if (proposal.status === "pending") continue;
+		if (new Date(proposal.updatedAt).getTime() < cutoff) rmSync(path, { force: true });
+	}
+}
 
-	// ─── System prompt injection ───────────────────────────────────────
+function inactiveSkills(paths: Paths, scope: Scope, config: ReviewConfig): string[] {
+	const stats = readStats(paths, scope);
+	const cutoff = Date.now() - config.inactiveDays * 24 * 60 * 60 * 1000;
+	return discoverSkills(paths)
+		.filter((skill) => skill.scope === scope)
+		.filter((skill) => {
+			const entry = stats.skills[skill.name];
+			if (!entry) return statSync(skill.path).mtimeMs < cutoff;
+			const dates = [entry.lastExplicitInvocation, entry.lastSkillLoad].filter(Boolean) as string[];
+			const lastActivity = dates.length ? Math.max(...dates.map((date) => new Date(date).getTime())) : 0;
+			return lastActivity < cutoff;
+		})
+		.map((skill) => skill.name)
+		.sort();
+}
 
-	pi.on("before_agent_start", (_event, ctx) => {
-		if (ctx.getSystemPrompt().includes(SKILL_GUIDANCE)) return;
-		return { systemPrompt: ctx.getSystemPrompt() + SKILL_GUIDANCE };
+function scopeFrom(value: string | undefined): Scope | undefined {
+	if (value === undefined) return undefined;
+	if (value !== "global" && value !== "project") throw new Error('Scope must be "global" or "project"');
+	return value;
+}
+
+function findSection(text: string, query: string): string {
+	const index = text.indexOf(query);
+	if (index < 0) return truncateText(text.slice(0, 2000));
+	const nextHeading = text.indexOf("\n#", index + query.length);
+	return truncateText(text.slice(index, nextHeading < 0 ? undefined : nextHeading));
+}
+
+const SkillManageParameters = Type.Object({
+	operation: StringEnum(["create", "edit", "patch", "delete", "list", "inspect", "write_file"] as const),
+	skillName: Type.Optional(Type.String({ description: "Skill name" })),
+	scope: Type.Optional(StringEnum(["global", "project"] as const)),
+	proposalId: Type.Optional(Type.String({ description: "Approved proposal ID for protected writes" })),
+	description: Type.Optional(Type.String()),
+	content: Type.Optional(Type.String({ description: "Body, file content, or inspect section query" })),
+	path: Type.Optional(Type.String({ description: "Relative package path for write_file" })),
+	find: Type.Optional(Type.String({ description: "Unique exact text for patch" })),
+	replace: Type.Optional(Type.String({ description: "Replacement text for patch" })),
+});
+
+export default function skillEvolution(pi: ExtensionAPI) {
+	let paths = getPaths(process.cwd());
+	let config = readConfig(paths, false);
+	let pendingAgentMessages: unknown[] = [];
+	let pendingRuns: RunRecord[] = [];
+	let nextRunIndex = 1;
+	let reviewedThrough = 0;
+	let reviewRunning = false;
+	const reviewQueue: Array<{ runs: RunRecord[]; ctx: ExtensionContext }> = [];
+	let sessionAbort = new AbortController();
+
+	function restoreReviewState(ctx: ExtensionContext): void {
+		pendingRuns = [];
+		nextRunIndex = 1;
+		reviewedThrough = 0;
+		for (const entry of ctx.sessionManager.getBranch()) {
+			if (entry.type !== "custom") continue;
+			if (entry.customType === RUN_ENTRY_TYPE) {
+				const record = entry.data as RunRecord;
+				if (record && typeof record.index === "number" && typeof record.text === "string") {
+					pendingRuns.push(record);
+					nextRunIndex = Math.max(nextRunIndex, record.index + 1);
+				}
+			} else if (entry.customType === REVIEW_STATE_ENTRY_TYPE) {
+				const state = entry.data as { reviewedThrough?: number };
+				reviewedThrough = Math.max(reviewedThrough, state.reviewedThrough ?? 0);
+			}
+		}
+		pendingRuns = pendingRuns.filter((record) => record.index > reviewedThrough).sort((a, b) => a.index - b.index);
+	}
+
+	async function logReviewError(error: unknown): Promise<void> {
+		const path = join(paths.projectState, "review-errors.log");
+		await withFileMutationQueue(path, async () => {
+			mkdirSync(dirname(path), { recursive: true });
+			appendFileSync(path, `${new Date().toISOString()} ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`, {
+				encoding: "utf8",
+				mode: 0o600,
+			});
+		});
+	}
+
+	async function drainReviewQueue(): Promise<void> {
+		if (reviewRunning) return;
+		reviewRunning = true;
+		try {
+			while (reviewQueue.length > 0 && !sessionAbort.signal.aborted) {
+				const item = reviewQueue.shift()!;
+				const combined = createReviewSignal(sessionAbort.signal);
+				try {
+					const proposals = await runReviewer(item.ctx, paths, config, item.runs, combined.signal);
+					if (proposals.length > 0 && item.ctx.hasUI) {
+						item.ctx.ui.notify(
+							`Skill evolution created ${proposals.length} proposal(s). Use /skill-evolution proposal list.`,
+							"info",
+						);
+					}
+				} catch (error) {
+					if (!sessionAbort.signal.aborted) await logReviewError(error);
+				} finally {
+					combined.cleanup();
+					const last = item.runs[item.runs.length - 1]?.index;
+					if (last && !sessionAbort.signal.aborted) {
+						reviewedThrough = Math.max(reviewedThrough, last);
+						pi.appendEntry(REVIEW_STATE_ENTRY_TYPE, { reviewedThrough });
+					}
+				}
+			}
+		} finally {
+			reviewRunning = false;
+		}
+	}
+
+	function queueReview(runs: RunRecord[], ctx: ExtensionContext): void {
+		if (runs.length === 0) return;
+		reviewQueue.push({ runs, ctx });
+		void drainReviewQueue();
+	}
+
+	pi.on("before_agent_start", (event) => {
+		if (event.systemPrompt.includes(REVIEW_GUARDRAIL)) return;
+		return { systemPrompt: event.systemPrompt + REVIEW_GUARDRAIL };
 	});
 
-	// ─── Post-turn review loop ─────────────────────────────────────────
+	pi.on("session_start", async (_event, ctx) => {
+		paths = getPaths(ctx.cwd);
+		const projectTrusted = ctx.isProjectTrusted();
+		config = readConfig(paths, projectTrusted);
+		sessionAbort = new AbortController();
+		pendingAgentMessages = [];
+		reviewQueue.length = 0;
+		reviewRunning = false;
+		restoreReviewState(ctx);
+		cleanOldProposals(paths, projectTrusted);
 
-	let reviewCooldown = 0;
+		const oldStats = join(paths.globalSkills, ".skill-stats.json");
+		if (existsSync(oldStats)) rmSync(oldStats, { force: true });
+
+		const enabledScopes: Scope[] = projectTrusted ? ["global", "project"] : ["global"];
+		const initialReminderChoice = enabledScopes.some(
+			(scope) => readStats(paths, scope).reminderEnabled === null,
+		)
+			? ctx.mode === "tui"
+				? await ctx.ui.confirm("Inactive skill reminders", "Enable weekly inactive-skill reminders?")
+				: false
+			: undefined;
+		for (const scope of enabledScopes) {
+			const stats = readStats(paths, scope);
+			if (stats.reminderEnabled === null) {
+				stats.reminderEnabled = initialReminderChoice ?? false;
+				await queuedWriteJson(statsPath(paths, scope), stats);
+			}
+			if (!stats.reminderEnabled) continue;
+			const lastCheck = stats.lastReminderCheck ? new Date(stats.lastReminderCheck).getTime() : 0;
+			if (lastCheck && Date.now() - lastCheck < REMINDER_INTERVAL_MS) continue;
+			const inactive = inactiveSkills(paths, scope, config);
+			stats.lastReminderCheck = new Date().toISOString();
+			await queuedWriteJson(statsPath(paths, scope), stats);
+			if (inactive.length > 0 && ctx.hasUI) {
+				ctx.ui.notify(`Inactive ${scope} skills: ${inactive.join(", ")}`, "info");
+			}
+		}
+	});
+
+	pi.on("session_shutdown", () => {
+		sessionAbort.abort();
+		reviewQueue.length = 0;
+	});
+
+	pi.on("agent_end", (event) => {
+		pendingAgentMessages.push(...event.messages);
+	});
 
 	pi.on("agent_settled", (_event, ctx) => {
 		if (!ctx.isIdle()) return;
-		reviewCooldown += 1;
-		// Keep the review cadence moderate: 10 settled turns by default.
-		// Too frequent (3) floods the conversation; too sparse (25+) risks
-		// missing the moment before context is lost. Use /skill-evolution
-		// review now for on-demand triggers.
-		if (reviewCooldown % 10 !== 0) return;
+		const record: RunRecord = {
+			index: nextRunIndex++,
+			timestamp: new Date().toISOString(),
+			text: serializeRun(pendingAgentMessages),
+		};
+		pendingAgentMessages = [];
+		pendingRuns.push(record);
+		pi.appendEntry(RUN_ENTRY_TYPE, record);
 
-		// ── Auto review (timed cadence) ──
-		pi.sendUserMessage(
-			`\u{200b}⚡ [${new Date().toISOString().slice(0, 19).replace("T", " ")}] Consider saving noteworthy workflows as skills via skill_manage. If nothing noteworthy, reply "no skill update needed".`,
-			{ deliverAs: "followUp" },
-		);
-	});
-
-	// ─── Weekly inactive-skill reminder (on session_start) ─────────────
-
-	pi.on("session_start", (_event, _ctx) => {
-		const stats = readStats(SKILLS_DIR);
-		if (!stats.reminderEnabled) return;
-
-		const now = Date.now();
-		const lastCheck = stats.lastReminderCheck
-			? new Date(stats.lastReminderCheck).getTime()
-			: 0;
-
-		if (lastCheck > 0 && now - lastCheck < REMINDER_INTERVAL_MS) return;
-
-		const inactive = getInactiveSkills(SKILLS_DIR, stats);
-		if (inactive.length === 0) {
-			stats.lastReminderCheck = new Date().toISOString();
-			writeStats(SKILLS_DIR, stats);
-			return;
+		while (pendingRuns.length >= config.reviewInterval) {
+			const batch = pendingRuns.splice(0, config.reviewInterval);
+			queueReview(batch, ctx);
 		}
-
-		const lines = inactiveReportLines(inactive);
-		stats.lastReminderCheck = new Date().toISOString();
-		writeStats(SKILLS_DIR, stats);
-		pi.sendUserMessage(lines.join("\n"), { deliverAs: "followUp" });
 	});
 
-	// ─── skill_manage tool ─────────────────────────────────────────────
+	pi.on("input", async (event, ctx) => {
+		const match = event.text.match(/^\/skill:([a-z0-9-]+)(?:\s|$)/);
+		if (!match) return { action: "continue" as const };
+		try {
+			const skill = resolveSkill(paths, match[1]);
+			if (skill.scope === "global" || ctx.isProjectTrusted()) {
+				await updateStats(paths, skill.scope, skill.name, "explicitInvocation", skill.description);
+			}
+		} catch {
+			// Pi will report unknown skill commands itself.
+		}
+		return { action: "continue" as const };
+	});
+
+	pi.on("tool_call", async (event, ctx) => {
+		if (event.toolName !== "read") return;
+		const input = event.input as { path?: string };
+		if (!input.path || !/SKILL\.md$/i.test(input.path)) return;
+		const requested = resolve(ctx.cwd, input.path.replace(/^@/, ""));
+		const skill = discoverSkills(paths).find((candidate) => resolve(candidate.path) === requested);
+		if (skill && (skill.scope === "global" || ctx.isProjectTrusted())) {
+			await updateStats(paths, skill.scope, skill.name, "skillLoad", skill.description);
+		}
+	});
 
 	pi.registerTool({
 		name: "skill_manage",
 		label: "Skill Manager",
 		description:
-			"Create, edit, patch, delete, list, or inspect agent skills. " +
-			"Use after completing complex tasks, fixing errors, or discovering new workflows. " +
-			"Skills are SKILL.md files stored under the agent skills directory. " +
-			'Use "patch" for small surgical edits, "edit" for full rewrites, "create" for new skills.',
-		parameters: Type.Object({
-			operation: Type.Enum({
-				create: "create",
-				edit: "edit",
-				patch: "patch",
-				delete: "delete",
-				list: "list",
-				inspect: "inspect",
-			}),
-			skillName: Type.String({
-				description: "Skill name (lowercase, hyphen-separated, max 64 chars).",
-			}),
-			description: Type.Optional(
-				Type.String({
-					description:
-						"Skill description for create/edit. Must be specific: what it does AND when to use it.",
-				}),
-			),
-			content: Type.Optional(
-				Type.String({
-					description:
-						'Full body content for create/edit (without frontmatter). For "inspect", the key section to show.',
-				}),
-			),
-			find: Type.Optional(
-				Type.String({
-					description:
-						'For "patch": exact text to find (case-sensitive). Use only a small, unique snippet.',
-				}),
-			),
-			replace: Type.Optional(
-				Type.String({
-					description: 'For "patch": replacement text.',
-				}),
-			),
-		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-			const { operation, skillName } = params;
-
+			"Inspect and list skills, apply a unique body-only SKILL.md patch, or execute an approved skill-evolution proposal. Protected writes require proposalId.",
+		parameters: SkillManageParameters,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const operation = params.operation;
 			if (operation === "list") {
-				const result = listSkills(SKILLS_DIR);
-				recordSkillUsage(SKILLS_DIR, "__list__", "list");
-				return result;
+				const lines = discoverSkills(paths)
+					.filter((skill) => skill.scope === "global" || ctx.isProjectTrusted())
+					.map(
+					(skill) => `- [${skill.scope}] **${skill.name}**: ${skill.description || "(no description)"}`,
+				);
+				return { content: [{ type: "text" as const, text: truncateText(lines.join("\n") || "No skills found") }], details: {} };
 			}
 
-			const err = validateName(skillName);
-			if (err)
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: `Invalid skill name "${skillName}": ${err}`,
-						},
-					],
-					isError: true,
-					details: {},
-				};
-
-			const skillDir = join(SKILLS_DIR, skillName);
-			const skillPath = join(skillDir, "SKILL.md");
-
+			const skillName = requireValidName(params.skillName);
+			const requestedScope = scopeFrom(params.scope);
+			if (requestedScope === "project" && !ctx.isProjectTrusted()) {
+				throw new Error("Project-scope skill operations require a trusted project");
+			}
 			if (operation === "inspect") {
-				if (!existsSync(skillPath)) {
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text: `Skill "${skillName}" not found at ${skillPath}`,
-							},
-						],
-						isError: true,
-						details: {},
-					};
+				const skill = resolveSkill(paths, skillName, requestedScope);
+				if (skill.scope === "project" && !ctx.isProjectTrusted()) {
+					throw new Error("Inspecting a project skill requires a trusted project");
 				}
-				const text = readFileSync(skillPath, "utf-8");
-				recordSkillUsage(SKILLS_DIR, skillName, "inspect");
-				if (params.content) {
-					const section = text.includes(params.content)
-						? params.content
-						: text.slice(0, 2000);
-					return {
-						content: [{ type: "text" as const, text: section }],
-						details: {},
-					};
-				}
-				return { content: [{ type: "text" as const, text }], details: {} };
-			}
-
-			if (operation === "create") {
-				const desc = params.description;
-				if (!desc)
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text: 'Missing "description" for create',
-							},
-						],
-						isError: true,
-						details: {},
-					};
-				if (existsSync(skillPath))
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text: `Skill "${skillName}" already exists at ${skillPath}. Use "edit" or "patch" to update.`,
-							},
-						],
-						isError: true,
-						details: {},
-					};
-
-				mkdirSync(skillDir, { recursive: true });
-				writeFileSync(
-					skillPath,
-					buildSkillMd(skillName, desc, params.content ?? `# ${skillName}`),
-					"utf-8",
-				);
-				recordSkillUsage(SKILLS_DIR, skillName, "create", desc);
+				const text = readFileSync(skill.path, "utf8");
+				await updateStats(paths, skill.scope, skill.name, "management", skill.description);
 				return {
-					content: [
-						{
-							type: "text" as const,
-							text: `Created skill "${skillName}" at ${skillPath}`,
-						},
-					],
-					details: { path: skillPath },
+					content: [{ type: "text" as const, text: params.content ? findSection(text, params.content) : truncateText(text) }],
+					details: { path: skill.path, scope: skill.scope },
 				};
 			}
 
-			if (operation === "edit") {
-				if (!existsSync(skillPath))
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text: `Skill "${skillName}" not found. Use "create" first.`,
-							},
-						],
-						isError: true,
-						details: {},
-					};
-				const desc = params.description;
-				if (!desc)
-					return {
-						content: [
-							{ type: "text" as const, text: 'Missing "description" for edit' },
-						],
-						isError: true,
-						details: {},
-					};
-				writeFileSync(
-					skillPath,
-					buildSkillMd(skillName, desc, params.content ?? ""),
-					"utf-8",
-				);
-				recordSkillUsage(SKILLS_DIR, skillName, "edit", desc);
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: `Updated skill "${skillName}" at ${skillPath}`,
-						},
-					],
-					details: { path: skillPath },
-				};
+			if (operation === "patch" && !params.proposalId) {
+				if (!requestedScope) throw new Error('Body-only patch requires explicit "scope"');
+				if (!params.find) throw new Error('Missing "find" for patch');
+				const path = await safeBodyPatch(paths, requestedScope, skillName, params.find, params.replace ?? "");
+				return { content: [{ type: "text" as const, text: `Patched ${path}` }], details: { path } };
 			}
 
-			if (operation === "patch") {
-				if (!existsSync(skillPath))
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text: `Skill "${skillName}" not found. Use "create" first.`,
-							},
-						],
-						isError: true,
-						details: {},
-					};
-				if (!params.find)
-					return {
-						content: [{ type: "text" as const, text: 'Missing "find" for patch' }],
-						isError: true,
-						details: {},
-					};
-				const text = readFileSync(skillPath, "utf-8");
-				if (!text.includes(params.find))
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text: `Patch failed: "${params.find.slice(0, 60)}..." not found in ${skillPath}`,
-							},
-						],
-						isError: true,
-						details: {},
-					};
-				const count = (
-					text.match(
-						new RegExp(params.find.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"),
-					) ?? []
-				).length;
-				if (count > 1)
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text: `Patch ambiguous: "${params.find.slice(0, 60)}..." found ${count} times. Use a longer, unique snippet.`,
-							},
-						],
-						isError: true,
-						details: {},
-					};
-				const newText = text.replace(params.find, params.replace ?? "");
-				writeFileSync(skillPath, newText, "utf-8");
-				recordSkillUsage(SKILLS_DIR, skillName, "patch");
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: `Patched skill "${skillName}" at ${skillPath}`,
-						},
-					],
-					details: { path: skillPath },
-				};
+			if (!params.proposalId) throw new Error(`${operation} requires an approved proposalId`);
+			const found = findProposal(paths, params.proposalId, ctx.isProjectTrusted());
+			if (requestedScope && requestedScope !== found.proposal.scope) {
+				throw new Error(`Proposal scope is ${found.proposal.scope}, not ${requestedScope}`);
 			}
-
-			if (operation === "delete") {
-				if (!existsSync(skillPath))
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text: `Skill "${skillName}" not found.`,
-							},
-						],
-						isError: true,
-						details: {},
-					};
-				unlinkSync(skillPath);
-				const dirContents = readdirSync(skillDir);
-				if (dirContents.length === 0) {
-					mkdirSync(`${skillDir}/tmp`, { recursive: true });
-					unlinkSync(`${skillDir}/tmp`);
-				}
-				recordSkillUsage(SKILLS_DIR, skillName, "delete");
-				return {
-					content: [{ type: "text" as const, text: `Deleted skill "${skillName}"` }],
-					details: {},
-				};
+			const expectedType = operation === "write_file" ? "write" : operation === "delete" ? "disable" : operation;
+			if (!found.proposal.operations.some((item) => item.skillName === skillName && item.type === expectedType)) {
+				throw new Error(`Proposal ${params.proposalId} has no ${expectedType} operation for skill "${skillName}"`);
 			}
-
+			if (found.proposal.scope === "project" && !ctx.isProjectTrusted()) {
+				throw new Error("Applying a project proposal requires a trusted project");
+			}
+			await applyProposal(paths, found.path, found.proposal, ctx.isProjectTrusted());
 			return {
-				content: [
-					{ type: "text" as const, text: `Unknown operation: ${operation}` },
-				],
-				isError: true,
-				details: {},
+				content: [{ type: "text" as const, text: `Applied proposal ${found.proposal.id}. Run /reload if discovery data changed.` }],
+				details: { proposalId: found.proposal.id },
 			};
 		},
 	});
 
-	// ─── /skill-evolution command ──────────────────────────────────────
-
 	pi.registerCommand("skill-evolution", {
-		description:
-			"Skill evolution management. Subcommands: reminder on|off|status|check, inactive, stats, disable/enable <name>",
+		description: "Review skill evolution proposals, statistics, reminders, and disabled skills",
 		getArgumentCompletions: (prefix) => {
-			const subcommands = [
+			const commands = [
+				"review now",
+				"proposal list",
+				"proposal show ",
+				"proposal apply ",
+				"proposal reject ",
+				"stats",
+				"inactive",
 				"reminder on",
 				"reminder off",
 				"reminder status",
-				"reminder check",
-				"inactive",
-				"stats",
-				"review now",
-				"disable ",
-				"enable ",
+				"disable global ",
+				"disable project ",
+				"enable global ",
+				"enable project ",
+				"purge global ",
+				"purge project ",
 			];
-			const filtered = subcommands
-				.filter((c) => c.startsWith(prefix))
-				.map((c) => ({ value: c, label: c }));
-			if (filtered.length > 0) return filtered;
-			return null;
+			const matches = commands.filter((command) => command.startsWith(prefix));
+			return matches.length ? matches.map((value) => ({ value, label: value })) : null;
 		},
 		handler: async (args, ctx) => {
 			const trimmed = args.trim();
-
-			// ── review subcommand ──
+			const tokens = trimmed.split(/\s+/).filter(Boolean);
 
 			if (trimmed === "review now") {
-				const now = new Date().toISOString().slice(0, 19).replace("T", " ");
-				const inactive = getInactiveSkills(SKILLS_DIR, readStats(SKILLS_DIR));
-				const hint =
-					inactive.length > 0
-						? ` (${inactive.length} inactive skill(s) — review them too)`
-						: "";
-				pi.sendUserMessage(
-					`\u{200b}⚡ [${now}] Manual review triggered${hint}. Consider saving noteworthy workflows as skills via skill_manage. If nothing noteworthy, reply "no skill update needed".`,
-					{ deliverAs: "followUp" },
-				);
-				return;
-			}
-
-			// ── reminder subcommands ──
-
-			if (trimmed === "reminder on") {
-				const stats = readStats(SKILLS_DIR);
-				stats.reminderEnabled = true;
-				writeStats(SKILLS_DIR, stats);
-				ctx.ui.notify(
-					"✅ Weekly inactive-skill reminder enabled (persistent)",
-					"info",
-				);
-				return;
-			}
-
-			if (trimmed === "reminder off") {
-				const stats = readStats(SKILLS_DIR);
-				stats.reminderEnabled = false;
-				writeStats(SKILLS_DIR, stats);
-				ctx.ui.notify(
-					"🛑 Weekly inactive-skill reminder disabled (persistent)",
-					"info",
-				);
-				return;
-			}
-
-			if (trimmed === "reminder status") {
-				const stats = readStats(SKILLS_DIR);
-				ctx.ui.notify(
-					buildReminderText(stats.reminderEnabled, stats.lastReminderCheck),
-					"info",
-				);
-				return;
-			}
-
-			if (trimmed === "reminder check") {
-				const stats = readStats(SKILLS_DIR);
-				const inactive = getInactiveSkills(SKILLS_DIR, stats);
-				stats.lastReminderCheck = new Date().toISOString();
-				writeStats(SKILLS_DIR, stats);
-
-				if (inactive.length === 0) {
-					pi.sendUserMessage(
-						"\u{200b}✅ **Weekly Inactive Skills Check**: All skills are active (used within 30 days).",
-						{ deliverAs: "followUp" },
-					);
-				} else {
-					pi.sendUserMessage(inactiveReportLines(inactive).join("\n"), {
-						deliverAs: "followUp",
-					});
-				}
-				return;
-			}
-
-			// ── inactive subcommand ──
-
-			if (trimmed === "inactive") {
-				const stats = readStats(SKILLS_DIR);
-				const inactive = getInactiveSkills(SKILLS_DIR, stats);
-				if (inactive.length === 0) {
-					ctx.ui.notify("✅ All skills are active (used within 30 days)", "info");
+				const batch = pendingRuns.splice(0);
+				if (batch.length === 0) {
+					ctx.ui.notify("No unreviewed agent runs", "info");
 					return;
 				}
-				ctx.ui.notify(inactiveReportLines(inactive).join("\n"), "info");
+				queueReview(batch, ctx);
+				ctx.ui.notify(`Queued review of ${batch.length} agent run(s)`, "info");
 				return;
 			}
 
-			// ── stats subcommand ──
-
-			if (trimmed === "stats") {
-				const stats = readStats(SKILLS_DIR);
-				ctx.ui.notify(buildStatsReport(SKILLS_DIR, stats).join("\n"), "info");
+			if (tokens[0] === "proposal") {
+				if (tokens[1] === "list") {
+					const proposals = listProposals(paths, ctx.isProjectTrusted());
+					const text = proposals.length
+						? proposals.map(({ proposal }) => `${proposal.id} [${proposal.status}/${proposal.scope}] ${proposal.title}`).join("\n")
+						: "No proposals found";
+					ctx.ui.notify(truncateText(text), "info");
+					return;
+				}
+				if ((tokens[1] === "show" || tokens[1] === "apply" || tokens[1] === "reject") && tokens[2]) {
+					const found = findProposal(paths, tokens[2], ctx.isProjectTrusted());
+					if (tokens[1] === "show") {
+						ctx.ui.notify(truncateText(proposalSummary(found.proposal)), "info");
+						return;
+					}
+					if (tokens[1] === "reject") {
+						if (found.proposal.status !== "pending") throw new Error(`Proposal is ${found.proposal.status}`);
+						found.proposal.status = "rejected";
+						found.proposal.updatedAt = new Date().toISOString();
+						await queuedWriteJson(found.path, found.proposal);
+						ctx.ui.notify(`Rejected proposal ${found.proposal.id}`, "info");
+						return;
+					}
+					await applyProposal(paths, found.path, found.proposal, ctx.isProjectTrusted());
+					ctx.ui.notify(`Applied proposal ${found.proposal.id}. Run /reload if discovery data changed.`, "info");
+					return;
+				}
+				ctx.ui.notify("Usage: /skill-evolution proposal list|show|apply|reject [id]", "error");
 				return;
 			}
 
-			// ── disable subcommand ──
-
-			if (trimmed.startsWith("disable ")) {
-				const targetName = trimmed.slice(8).trim();
-				if (!targetName) {
-					ctx.ui.notify("Usage: /skill-evolution disable <skill-name>", "error");
-					return;
+			if (trimmed === "stats" || trimmed === "inactive") {
+				const lines: string[] = [];
+				const scopes: Scope[] = ctx.isProjectTrusted() ? ["global", "project"] : ["global"];
+				for (const scope of scopes) {
+					if (trimmed === "inactive") {
+						lines.push(`${scope}: ${inactiveSkills(paths, scope, config).join(", ") || "none"}`);
+						continue;
+					}
+					const stats = readStats(paths, scope);
+					lines.push(`[${scope}]`);
+					for (const [name, entry] of Object.entries(stats.skills).sort(([a], [b]) => a.localeCompare(b))) {
+						lines.push(
+							`${name}: explicit=${entry.explicitInvocationCount}, loads=${entry.skillLoadCount}, management=${entry.managementOperations}`,
+						);
+					}
 				}
-				const targetDir = join(SKILLS_DIR, targetName);
-				if (!existsSync(targetDir) || !statSync(targetDir).isDirectory()) {
-					ctx.ui.notify(`Skill "${targetName}" not found`, "error");
-					return;
-				}
-				const disabledDir = join(SKILLS_DIR, `.disabled-${targetName}`);
-				if (existsSync(disabledDir)) {
-					ctx.ui.notify(
-						`Skill "${targetName}" is already disabled (or .disabled-${targetName} exists)`,
-						"error",
-					);
-					return;
-				}
-				renameSync(targetDir, disabledDir);
-				ctx.ui.notify(
-					`🚫 Disabled skill "${targetName}" (renamed to .disabled-${targetName})`,
-					"info",
-				);
+				ctx.ui.notify(truncateText(lines.join("\n")), "info");
 				return;
 			}
 
-			// ── enable subcommand ──
-
-			if (trimmed.startsWith("enable ")) {
-				const targetName = trimmed.slice(7).trim();
-				if (!targetName) {
-					ctx.ui.notify("Usage: /skill-evolution enable <skill-name>", "error");
-					return;
+			if (tokens[0] === "reminder" && ["on", "off", "status"].includes(tokens[1])) {
+				const scopes: Scope[] = ctx.isProjectTrusted() ? ["global", "project"] : ["global"];
+				for (const scope of scopes) {
+					const stats = readStats(paths, scope);
+					if (tokens[1] === "on") stats.reminderEnabled = true;
+					if (tokens[1] === "off") stats.reminderEnabled = false;
+					if (tokens[1] !== "status") await queuedWriteJson(statsPath(paths, scope), stats);
 				}
-				const disabledDir = join(SKILLS_DIR, `.disabled-${targetName}`);
-				if (!existsSync(disabledDir)) {
-					ctx.ui.notify(
-						`Disabled skill "${targetName}" not found. Maybe it's already enabled?`,
-						"error",
-					);
-					return;
-				}
-				const targetDir = join(SKILLS_DIR, targetName);
-				renameSync(disabledDir, targetDir);
-				ctx.ui.notify(`✅ Re-enabled skill "${targetName}"`, "info");
+				const status = scopes
+					.map((scope) => `${scope}=${readStats(paths, scope).reminderEnabled ? "on" : "off"}`)
+					.join(", ");
+				ctx.ui.notify(`Inactive reminders: ${status}`, "info");
 				return;
 			}
 
-			// ── default: show help ──
+			if (["disable", "enable", "purge"].includes(tokens[0]) && tokens[1] && tokens[2]) {
+				const action = tokens[0];
+				const scope = scopeFrom(tokens[1])!;
+				if (scope === "project" && !ctx.isProjectTrusted()) {
+					throw new Error("Project-scope commands require a trusted project");
+				}
+				const name = requireValidName(tokens[2]);
+				const active = skillDirectory(paths, scope, name);
+				const disabled = join(skillsDir(paths, scope), `.disabled-${name}`);
+				if (action === "disable") {
+					if (!existsSync(join(active, "SKILL.md"))) throw new Error(`Active skill "${name}" was not found`);
+					if (existsSync(disabled)) throw new Error(`Disabled skill "${name}" already exists`);
+					renameSync(active, disabled);
+					await appendAudit(paths, scope, { action, skillName: name });
+					ctx.ui.notify(`Disabled ${scope} skill "${name}". Run /reload.`, "info");
+					return;
+				}
+				if (action === "enable") {
+					if (!existsSync(disabled)) throw new Error(`Disabled skill "${name}" was not found`);
+					if (existsSync(active)) throw new Error(`Active target "${name}" already exists`);
+					renameSync(disabled, active);
+					await appendAudit(paths, scope, { action, skillName: name });
+					ctx.ui.notify(`Enabled ${scope} skill "${name}". Run /reload.`, "info");
+					return;
+				}
+				const target = existsSync(disabled) ? disabled : active;
+				if (!existsSync(target)) throw new Error(`Skill "${name}" was not found`);
+				if (!ctx.hasUI || !(await ctx.ui.confirm("Purge skill package?", `Delete ${target} permanently?`))) return;
+				rmSync(target, { recursive: true, force: true });
+				await appendAudit(paths, scope, { action, skillName: name });
+				ctx.ui.notify(`Purged ${scope} skill "${name}". Run /reload.`, "info");
+				return;
+			}
 
 			ctx.ui.notify(
-				"📋 **Skill Evolution Commands**\n\n" +
-					"/skill-evolution review now        — Trigger a skill review session now\n" +
-					"/skill-evolution reminder on      — Enable weekly inactive-skill reminder\n" +
-					"/skill-evolution reminder off     — Disable weekly reminder\n" +
-					"/skill-evolution reminder status  — Show reminder status\n" +
-					"/skill-evolution reminder check   — Manually check inactive skills now\n" +
-					"/skill-evolution inactive         — List inactive skills\n" +
-					"/skill-evolution stats            — Show usage statistics for all skills\n" +
-					"/skill-evolution disable <name>   — Disable a skill (rename to .disabled-<name>)\n" +
-					"/skill-evolution enable <name>    — Re-enable a disabled skill",
+				"Commands: review now; proposal list|show|apply|reject; stats; inactive; reminder on|off|status; disable|enable|purge <scope> <name>",
 				"info",
 			);
 		},

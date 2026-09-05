@@ -1,54 +1,99 @@
 # pi-skill-evolution
 
-给 Pi Agent 的 Hermes Agent 风格自动技能进化扩展。
+为 Pi Agent 提供安全的 skill package 管理和隔离的 skill evolution review。
 
-Pi Agent 已经有很好的技能系统和扩展 API，但缺少"自动创建/修改/进化技能"的闭环能力——这正是 Hermes Agent 通过 `background_review` 和 `skill_manage` 实现的核心特性。本仓库在 Pi 的 event-driven 架构上补齐这块拼图。
+## 架构
 
-## Review 频率
+- 隔离 reviewer 分析已完成的 agent runs，并生成 proposal。
+- `skill_manage` 读取 skill package，并执行受保护的文件修改。
+- Reviewer 不能直接修改 skill。
 
-### Background review loop
+## Review loop
 
-默认每 10 次 settled turn 触发一次 review（比 3 次更节制，避免刷屏；比 25 次更紧凑，不丢失上下文）。同时支持手动触发：`/skill-evolution review now`。
+每个 session 单独统计 `agent_settled`。一次 `agent_settled` 表示一个 agent run 已完全结束并进入 idle；run 内的 tool calls 不单独计数。
 
-消息已精简为**单行带时间戳**，不会把会话输出刷乱。
+每 10 个完成的 runs，extension 会：
 
-## 安装
+1. 读取下一个不重叠的 10-run 窗口；
+2. 移除图片、疑似 secret 和过大的值；
+3. 在独立 model context 中选择相关 skills；
+4. 只加载相关 skill bodies；
+5. 生成最多三个 JSON proposals。
 
-### 通过 npm（推荐）
+Reviewer 使用配置的 `reviewModel`，否则使用当前 model。Reviewer 的 prompt 和 response 不进入主 conversation context。没有 proposal 时不显示消息。
 
-```bash
-pi install npm:pi-agent-skill-evolution
+手动检查：
+
+```text
+/skill-evolution review now
 ```
 
-Pi 会自动发现并加载扩展和技能，无需任何设置变更。
+## Proposal
 
-### 直接复制（最轻量）
-
-```bash
-# 扩展
-cp extensions/skill-evolution.ts ~/.pi/agent/extensions/
-
-# 技能（写作指导，非必需）
-mkdir -p ~/.pi/agent/skills/skill-authoring
-cp skill-authoring/SKILL.md ~/.pi/agent/skills/skill-authoring/
+```text
+reviewer -> pending proposal -> human apply/reject -> transaction
 ```
 
-Pi 会自动发现并加载。
+Proposal 使用 source hashes 防止覆盖新修改。状态包括 `pending`、`applied`、`rejected` 和 `stale`。多文件 apply 失败时会回滚。
 
-## 环境变量
+```text
+/skill-evolution proposal list
+/skill-evolution proposal show <id>
+/skill-evolution proposal apply <id>
+/skill-evolution proposal reject <id>
+```
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `PI_SKILL_EVOLUTION_DIR` | `~/.pi/agent/skills/` | 技能存储目录 |
+## Scope
 
-更多细节见 [README.md](README.md)。
+- global：`~/.pi/agent/skills/<name>/`
+- project：`<cwd>/.agents/skills/<name>/`
 
-## 新增功能：使用统计与不活跃提醒（v0.1.2+）
+Project 操作要求 trusted project。写操作必须明确指定 scope。两个 scopes 不能创建相同的 skill name。
 
-本扩展增加了技能使用次数记录和每周不活跃提醒功能：
+## `skill_manage`
 
-- 每次 `skill_manage` 调用自动记录使用次数和时间戳
-- 每 7 天检查一次超过 30 天未使用的技能，通过 follow-up 消息提醒用户
-- 使用 `/skill-evolution reminder on/off/status/check` 管理提醒开关（持久化）
-- 使用 `/skill-evolution disable <name>` / `enable <name>` 禁用/启用技能
-- 使用 `/skill-evolution stats` / `inactive` 查看统计和不活跃技能
+- `list`、`inspect`：读取操作。
+- `patch`：不需要 proposal，但只能修改 `SKILL.md` body 中唯一匹配的文本。
+- `create`、`edit`、`write_file`、`delete`：需要有效的 `proposalId`。
+- `delete` 表示 disable，不会永久删除 package。
+
+永久删除只能由用户执行：
+
+```text
+/skill-evolution purge global|project <name>
+```
+
+## 配置
+
+Global：`~/.pi/agent/skill-evolution/config.json`
+
+Project：`<cwd>/.pi/skill-evolution/config.json`
+
+```json
+{
+  "reviewModel": "google/gemini-2.5-flash",
+  "reviewInterval": 10,
+  "maxProposals": 3,
+  "inactiveDays": 30
+}
+```
+
+## Statistics
+
+统计分为：
+
+- `explicitInvocation`：调用 `/skill:name`；
+- `skillLoad`：读取对应 `SKILL.md`；
+- `managementOperations`：读取或修改 package。
+
+只有 invocation 和 load 表示 skill 活跃。旧 `.skill-stats.json` 会直接删除，不迁移。
+
+## Skill authoring
+
+`skill-authoring` 是 user-invoked skill，不进入默认 system context：
+
+```text
+/skill:skill-authoring
+```
+
+Create、description 或 invocation mode 修改、disable、enable、purge 后，请手动执行 `/reload`。
