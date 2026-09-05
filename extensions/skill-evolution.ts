@@ -6,29 +6,26 @@ import {
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import {
-	appendFileSync,
-	existsSync,
-	lstatSync,
-	mkdirSync,
-	readFileSync,
-	readdirSync,
-	realpathSync,
-	renameSync,
-	rmSync,
-	statSync,
-	unlinkSync,
-	writeFileSync,
-} from "node:fs";
-import { createHash, randomUUID } from "node:crypto";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { dirname, join, resolve } from "node:path";
 import {
 	buildSkillMd,
 	editSkillMd,
-	parseFrontmatter,
 	patchSkillMd,
 	splitSkillMd,
 } from "./skill-md-codec.ts";
+import {
+	discoverSkills,
+	fileHash,
+	hashText,
+	requireSkillName,
+	resolveSkill,
+	safePackagePath,
+	skillDirectory,
+	type Scope,
+	validateSkillName,
+} from "./skill-package.ts";
 
 const REVIEW_GUARDRAIL =
 	"\n\n## Skill Evolution\nDo not create or fully rewrite skills directly. Skill creation, frontmatter changes, package-file changes, and disabling require a skill-evolution proposal.\n";
@@ -86,7 +83,6 @@ interface StatsFile {
 	skills: Record<string, SkillActivity>;
 }
 
-type Scope = "global" | "project";
 type ProposalStatus = "pending" | "applied" | "rejected" | "stale";
 
 type ProposalOperation =
@@ -148,13 +144,6 @@ interface RunRecord {
 	index: number;
 	timestamp: string;
 	text: string;
-}
-
-interface SkillRecord {
-	name: string;
-	description: string;
-	scope: Scope;
-	path: string;
 }
 
 interface Paths {
@@ -304,61 +293,8 @@ function truncateText(text: string, maxBytes = MAX_TOOL_OUTPUT_BYTES): string {
 	return `${result}\n\n[Output truncated at ${maxBytes} bytes.]`;
 }
 
-function validateName(name: string): string | null {
-	if (!name || name.length > 64) return "Name must be 1-64 characters";
-	if (!/^[a-z0-9-]+$/.test(name)) return "Name must contain lowercase letters, digits, and hyphens only";
-	if (name.startsWith("-") || name.endsWith("-")) return "Name must not start or end with a hyphen";
-	if (name.includes("--")) return "Name must not contain consecutive hyphens";
-	return null;
-}
-
-function requireValidName(name: string | undefined): string {
-	if (!name) throw new Error('Missing "skillName"');
-	const error = validateName(name);
-	if (error) throw new Error(`Invalid skill name "${name}": ${error}`);
-	return name;
-}
-
-function hashText(text: string): string {
-	return createHash("sha256").update(text).digest("hex");
-}
-
-function fileHash(path: string): string | null {
-	return existsSync(path) && statSync(path).isFile() ? hashText(readFileSync(path, "utf8")) : null;
-}
-
-function assertInside(root: string, candidate: string): void {
-	const rel = relative(resolve(root), resolve(candidate));
-	if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
-		throw new Error(`Path escapes skill package: ${candidate}`);
-	}
-}
-
-function safePackagePath(root: string, relativePath: string): string {
-	if (!relativePath || isAbsolute(relativePath) || relativePath.split(/[\\/]+/).includes("..")) {
-		throw new Error(`Unsafe package path: ${relativePath}`);
-	}
-	const target = resolve(root, relativePath);
-	assertInside(root, target);
-
-	let current = root;
-	for (const part of relative(root, target).split(sep).filter(Boolean)) {
-		current = join(current, part);
-		if (!existsSync(current)) break;
-		if (lstatSync(current).isSymbolicLink()) {
-			const actual = realpathSync(current);
-			assertInside(root, actual);
-		}
-	}
-	return target;
-}
-
-function skillDirectory(paths: Paths, scope: Scope, skillName: string): string {
-	return join(skillsDir(paths, scope), requireValidName(skillName));
-}
-
 function operationPath(paths: Paths, scope: Scope, operation: ProposalOperation): string {
-	const root = skillDirectory(paths, scope, operation.skillName);
+	const root = skillDirectory(skillsDir(paths, scope), operation.skillName);
 	if (operation.type === "create" || operation.type === "edit" || operation.type === "disable") {
 		return join(root, "SKILL.md");
 	}
@@ -430,7 +366,7 @@ function attachHashes(paths: Paths, draft: ReviewerDraft): ProposalOperation[] {
 async function saveProposal(paths: Paths, draft: ReviewerDraft, includeProject: boolean): Promise<Proposal> {
 	if (draft.scope !== "global" && draft.scope !== "project") throw new Error("Proposal has invalid scope");
 	if (!draft.operations?.length) throw new Error("Proposal has no operations");
-	for (const operation of draft.operations) requireValidName(operation.skillName);
+	for (const operation of draft.operations) requireSkillName(operation.skillName);
 
 	const duplicate = listProposals(paths, includeProject).find(
 		({ proposal }) =>
@@ -484,9 +420,9 @@ function validateOperationMinimal(
 	createdSkills: Set<string>,
 	includeProject: boolean,
 ): void {
-	const error = validateName(operation.skillName);
+	const error = validateSkillName(operation.skillName);
 	if (error) throw new Error(error);
-	const skillMd = join(skillDirectory(paths, scope, operation.skillName), "SKILL.md");
+	const skillMd = join(skillDirectory(skillsDir(paths, scope), operation.skillName), "SKILL.md");
 	if (operation.type === "create") {
 		if (!operation.description.trim()) throw new Error("Create requires a description");
 		if (!operation.content.trim()) throw new Error("Create requires a non-empty body");
@@ -532,7 +468,7 @@ async function applyProposal(
 		const disabledRenames: Array<{ from: string; to: string }> = [];
 		try {
 			for (const operation of proposal.operations) {
-				const root = skillDirectory(paths, proposal.scope, operation.skillName);
+				const root = skillDirectory(skillsDir(paths, proposal.scope), operation.skillName);
 				const rootExisted = existsSync(root);
 				if (!rootExisted) createdSkillDirs.add(root);
 				const target = operationPath(paths, proposal.scope, operation);
@@ -609,7 +545,7 @@ async function safeBodyPatch(
 	find: string,
 	replace: string,
 ): Promise<string> {
-	const path = join(skillDirectory(paths, scope, skillName), "SKILL.md");
+	const path = join(skillDirectory(skillsDir(paths, scope), skillName), "SKILL.md");
 	return withFileMutationQueue(path, async () => {
 		if (!existsSync(path)) throw new Error(`Skill "${skillName}" was not found`);
 		const current = readFileSync(path, "utf8");
@@ -642,40 +578,6 @@ function loadAuthoringReference(paths: Paths): string {
 		"Change description only when capability, trigger branches, or invocation mode changes.",
 		"Move branch-only reference behind a relative context pointer.",
 	].join("\\n");
-}
-
-function discoverSkills(paths: Paths): SkillRecord[] {
-	const result: SkillRecord[] = [];
-	for (const scope of ["global", "project"] as const) {
-		const root = skillsDir(paths, scope);
-		if (!existsSync(root)) continue;
-		for (const directory of readdirSync(root).sort()) {
-			if (directory.startsWith(".disabled-")) continue;
-			const path = join(root, directory, "SKILL.md");
-			if (!existsSync(path)) continue;
-			try {
-				const parsed = parseFrontmatter(readFileSync(path, "utf8"));
-				result.push({
-					name: parsed.name ?? directory,
-					description: parsed.description ?? "",
-					scope,
-					path,
-				});
-			} catch {
-				// Ignore unreadable entries in discovery output.
-			}
-		}
-	}
-	return result;
-}
-
-function resolveSkill(paths: Paths, skillName: string, requestedScope?: Scope): SkillRecord {
-	const matches = discoverSkills(paths).filter(
-		(skill) => skill.name === skillName && (!requestedScope || skill.scope === requestedScope),
-	);
-	if (matches.length === 0) throw new Error(`Skill "${skillName}" was not found`);
-	if (matches.length > 1) throw new Error(`Skill "${skillName}" exists in both scopes; specify scope`);
-	return matches[0];
 }
 
 function redactText(text: string): string {
@@ -1070,7 +972,7 @@ export default function skillEvolution(pi: ExtensionAPI) {
 				return { content: [{ type: "text" as const, text: truncateText(lines.join("\n") || "No skills found") }], details: {} };
 			}
 
-			const skillName = requireValidName(params.skillName);
+			const skillName = requireSkillName(params.skillName);
 			const requestedScope = scopeFrom(params.scope);
 			if (requestedScope === "project" && !ctx.isProjectTrusted()) {
 				throw new Error("Project-scope skill operations require a trusted project");
@@ -1226,8 +1128,8 @@ export default function skillEvolution(pi: ExtensionAPI) {
 				if (scope === "project" && !ctx.isProjectTrusted()) {
 					throw new Error("Project-scope commands require a trusted project");
 				}
-				const name = requireValidName(tokens[2]);
-				const active = skillDirectory(paths, scope, name);
+				const name = requireSkillName(tokens[2]);
+				const active = skillDirectory(skillsDir(paths, scope), name);
 				const disabled = join(skillsDir(paths, scope), `.disabled-${name}`);
 				if (action === "disable") {
 					if (!existsSync(join(active, "SKILL.md"))) throw new Error(`Active skill "${name}" was not found`);
